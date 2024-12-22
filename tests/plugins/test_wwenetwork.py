@@ -1,19 +1,11 @@
-import unittest
-
 from streamlink.plugins.wwenetwork import WWENetwork
+from tests.plugins import PluginCanHandleUrl
 
 
-class TestPluginWWENetwork(unittest.TestCase):
-    def test_can_handle_url(self):
-        should_match = [
-            'http://network.wwe.com/shows/collections/267406022',
-        ]
-        for url in should_match:
-            self.assertTrue(WWENetwork.can_handle_url(url))
+class TestPluginCanHandleUrlWWENetwork(PluginCanHandleUrl):
+    __plugin__ = WWENetwork
 
-    def test_can_handle_url_negative(self):
-        should_not_match = [
-            'https://example.com/index.html',
-        ]
-        for url in should_not_match:
-            self.assertFalse(WWENetwork.can_handle_url(url))
+    should_match_groups = [
+        ("https://network.wwe.com/video/3622", {"stream_id": "3622"}),
+        ("https://network.wwe.com/live/3622", {"stream_id": "3622"}),
+    ]

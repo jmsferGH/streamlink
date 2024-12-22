@@ -1,16 +1,20 @@
-import unittest
-
 from streamlink.plugins.goltelevision import GOLTelevision
+from tests.plugins import PluginCanHandleUrl
 
 
-class TestPluginEuronews(unittest.TestCase):
-    def test_can_handle_url(self):
-        # should match
-        self.assertTrue(GOLTelevision.can_handle_url("http://www.goltelevision.com/live"))
-        self.assertTrue(GOLTelevision.can_handle_url("http://goltelevision.com/live"))
-        self.assertTrue(GOLTelevision.can_handle_url("https://goltelevision.com/live"))
-        self.assertTrue(GOLTelevision.can_handle_url("https://www.goltelevision.com/live"))
+class TestPluginCanHandleUrlGOLTelevision(PluginCanHandleUrl):
+    __plugin__ = GOLTelevision
 
-        # shouldn't match
-        self.assertFalse(GOLTelevision.can_handle_url("http://www.tvcatchup.com/"))
-        self.assertFalse(GOLTelevision.can_handle_url("http://www.youtube.com/"))
+    should_match = [
+        "http://goltelevision.com/en-directo",
+        "http://www.goltelevision.com/en-directo",
+        "https://goltelevision.com/en-directo",
+        "https://www.goltelevision.com/en-directo",
+    ]
+
+    should_not_match = [
+        "http://goltelevision.com/live",
+        "http://www.goltelevision.com/live",
+        "https://goltelevision.com/live",
+        "https://www.goltelevision.com/live",
+    ]

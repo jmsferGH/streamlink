@@ -1,71 +1,134 @@
+"""
+$description Bulgarian CDN hosting live content for various websites in Bulgaria.
+$url armymedia.bg
+$url bgonair.bg
+$url bloombergtv.bg
+$url bnt.bg
+$url live.bstv.bg
+$url i.cdn.bg
+$url nova.bg
+$url mu-vi.tv
+$type live
+$region Bulgaria
+"""
+
 import logging
 import re
+from urllib.parse import urlparse
 
-from streamlink.compat import urlparse
-from streamlink.plugin import Plugin
-from streamlink.plugin.api import useragents
+from streamlink.plugin import Plugin, pluginmatcher
 from streamlink.plugin.api import validate
-from streamlink.stream import HLSStream
-from streamlink.utils import update_scheme
+from streamlink.stream.hls import HLSStream
+from streamlink.utils.url import update_scheme
+
 
 log = logging.getLogger(__name__)
 
 
+@pluginmatcher(
+    name="armymedia",
+    pattern=re.compile(r"https?://(?:www\.)?armymedia\.bg/?"),
+)
+@pluginmatcher(
+    name="bgonair",
+    pattern=re.compile(r"https?://(?:www\.)?bgonair\.bg/tvonline/?"),
+)
+@pluginmatcher(
+    name="bloombergtv",
+    pattern=re.compile(r"https?://(?:www\.)?bloombergtv\.bg/video/?"),
+)
+@pluginmatcher(
+    name="bnt",
+    pattern=re.compile(r"https?://(?:www\.)?(?:tv\.)?bnt\.bg/\w+(?:/\w+)?/?"),
+)
+@pluginmatcher(
+    name="bstv",
+    pattern=re.compile(r"https?://(?:www\.)?live\.bstv\.bg/?"),
+)
+@pluginmatcher(
+    name="nova",
+    pattern=re.compile(r"https?://(?:www\.)?nova\.bg/live/?"),
+)
+@pluginmatcher(
+    name="mu-vi",
+    pattern=re.compile(r"https?://(?:www\.)?mu-vi\.tv/LiveStreams/pages/Live\.aspx/?"),
+)
+@pluginmatcher(
+    name="cdnbg",
+    pattern=re.compile(r"https?://(?:www\.)?i\.cdn\.bg/live/?"),
+)
 class CDNBG(Plugin):
-    url_re = re.compile(r"""
-        https?://(?:www\.)?(?:
-            tv\.bnt\.bg/\w+(?:/\w+)?|
-            bitelevision\.com/live|
-            nova\.bg/live|
-            kanal3\.bg/live|
-            bgonair\.bg/tvonline|
-            inlife\.bg|
-            mmtvmusic\.com/live|
-            mu-vi\.tv/LiveStreams/pages/Live\.aspx|
-            videochanel\.bstv\.bg|
-            bloombergtv.bg/video
-        )/?
-    """, re.VERBOSE)
-    iframe_re = re.compile(r"iframe .*?src=\"((?:https?(?::|&#58;))?//(?:\w+\.)?cdn.bg/live[^\"]+)\"", re.DOTALL)
-    sdata_re = re.compile(r"sdata\.src.*?=.*?(?P<q>[\"'])(?P<url>http.*?)(?P=q)")
-    hls_file_re = re.compile(r"(src|file): (?P<q>[\"'])(?P<url>(https?:)?//.+?m3u8.*?)(?P=q)")
-    hls_src_re = re.compile(r"video src=(?P<url>http[^ ]+m3u8[^ ]*)")
-
-    stream_schema = validate.Schema(
-        validate.any(
-            validate.all(validate.transform(sdata_re.search), validate.get("url")),
-            validate.all(validate.transform(hls_file_re.search), validate.get("url")),
-            validate.all(validate.transform(hls_src_re.search), validate.get("url")),
+    @staticmethod
+    def _find_url(regex: re.Pattern) -> validate.all:
+        return validate.all(
+            validate.regex(regex),
+            validate.get("url"),
         )
-    )
-
-    @classmethod
-    def can_handle_url(cls, url):
-        return cls.url_re.match(url) is not None
-
-    def find_iframe(self, res):
-        p = urlparse(self.url)
-        for url in self.iframe_re.findall(res.text):
-            if "googletagmanager" not in url:
-                url = url.replace("&#58;", ":")
-                if url.startswith("//"):
-                    return "{0}:{1}".format(p.scheme, url)
-                else:
-                    return url
 
     def _get_streams(self):
-        self.session.http.headers.update({"User-Agent": useragents.CHROME})
-        res = self.session.http.get(self.url)
-        iframe_url = self.find_iframe(res)
+        if "cdn.bg" in urlparse(self.url).netloc:
+            iframe_url = self.url
+            h = self.session.get_option("http-headers")
+            if not h or not h.get("Referer"):
+                log.error('Missing Referer for iframe URL, use --http-header "Referer=URL" ')
+                return
+            referer = h.get("Referer")
+        else:
+            referer = self.url
+            iframe_url = self.session.http.get(
+                self.url,
+                schema=validate.Schema(
+                    validate.any(
+                        self._find_url(
+                            re.compile(r"'src',\s*'(?P<url>https?://i\.cdn\.bg/live/\w+)'\);"),
+                        ),
+                        validate.all(
+                            validate.parse_html(),
+                            validate.xml_xpath_string(".//iframe[contains(@src,'cdn.bg')][1]/@src"),
+                        ),
+                    ),
+                ),
+            )
 
-        if iframe_url:
-            log.debug("Found iframe: {0}", iframe_url)
-            res = self.session.http.get(iframe_url, headers={"Referer": self.url})
-            stream_url = update_scheme(self.url, self.stream_schema.validate(res.text))
-            log.warning("SSL Verification disabled.")
-            return HLSStream.parse_variant_playlist(self.session,
-                                                    stream_url,
-                                                    verify=False)
+        if not iframe_url:
+            return
+
+        iframe_url = update_scheme("https://", iframe_url, force=False)
+        log.debug(f"Found iframe: {iframe_url}")
+
+        stream_url = self.session.http.get(
+            iframe_url,
+            headers={"Referer": referer},
+            schema=validate.Schema(
+                validate.any(
+                    self._find_url(
+                        re.compile(r"sdata\.src.*?=.*?(?P<q>[\"'])(?P<url>.*?)(?P=q)"),
+                    ),
+                    self._find_url(
+                        re.compile(r"(src|file): (?P<q>[\"'])(?P<url>(https?:)?//.+?m3u8.*?)(?P=q)"),
+                    ),
+                    self._find_url(
+                        re.compile(r"video src=(?P<url>http[^ ]+m3u8[^ ]*)"),
+                    ),
+                    self._find_url(
+                        re.compile(r"source src=\"(?P<url>[^\"]+m3u8[^\"]*)\""),
+                    ),
+                    # GEOBLOCKED
+                    self._find_url(
+                        re.compile(r"(?P<url>[^\"]+geoblock[^\"]+)"),
+                    ),
+                ),
+            ),
+        )
+        if "geoblock" in stream_url:
+            log.error("Geo-restricted content")
+            return
+
+        return HLSStream.parse_variant_playlist(
+            self.session,
+            update_scheme(iframe_url, stream_url),
+            headers={"Referer": "https://i.cdn.bg/"},
+        )
 
 
 __plugin__ = CDNBG

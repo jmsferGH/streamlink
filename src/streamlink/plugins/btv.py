@@ -1,86 +1,70 @@
-from __future__ import print_function
+"""
+$description A privately owned Bulgarian live TV channel.
+$url btvplus.bg
+$type live
+$region Bulgaria
+"""
+
+import logging
 import re
 
-from streamlink import PluginError
-from streamlink.plugin import Plugin
+from streamlink.plugin import Plugin, pluginmatcher
 from streamlink.plugin.api import validate
-from streamlink.stream import HLSStream
-from streamlink.utils import parse_json
-from streamlink.plugin import PluginArgument, PluginArguments
+from streamlink.stream.hls import HLSStream
 
 
+log = logging.getLogger(__name__)
+
+
+@pluginmatcher(
+    re.compile(r"https?://(?:www\.)?btvplus\.bg/live/?"),
+)
 class BTV(Plugin):
-    arguments = PluginArguments(
-        PluginArgument(
-            "username",
-            metavar="USERNAME",
-            requires=["password"],
-            help="""
-        A BTV username required to access any stream.
-        """
-        ),
-        PluginArgument(
-            "password",
-            sensitive=True,
-            metavar="PASSWORD",
-            help="""
-        A BTV account password to use with --btv-username.
-        """
-        )
-    )
-    url_re = re.compile(r"https?://(?:www\.)?btv\.bg/live/?")
-
-    api_url = "http://www.btv.bg/lbin/global/player_config.php"
-    check_login_url = "http://www.btv.bg/lbin/userRegistration/check_user_login.php"
-    login_url = "https://www.btv.bg/bin/registration2/login.php?action=login&settings=0"
-
-    media_id_re = re.compile(r"media_id=(\d+)")
-    src_re = re.compile(r"src: \"(http.*?)\"")
-    api_schema = validate.Schema(
-        validate.all(
-            {"status": "ok", "config": validate.text},
-            validate.get("config"),
-            validate.all(validate.transform(src_re.search),
-                         validate.any(
-                             None,
-                             validate.get(1), validate.url()
-                         ))
-        )
-    )
-
-    @classmethod
-    def can_handle_url(cls, url):
-        return cls.url_re.match(url) is not None
-
-    def login(self, username, password):
-        res = self.session.http.post(self.login_url, data={"username": username, "password": password})
-        if "success_logged_in" in res.text:
-            return True
-        else:
-            return False
-
-    def get_hls_url(self, media_id):
-        res = self.session.http.get(self.api_url, params=dict(media_id=media_id))
-        try:
-            return parse_json(res.text, schema=self.api_schema)
-        except PluginError:
-            return
+    URL_API = "https://btvplus.bg/lbin/v3/btvplus/player_config.php"
 
     def _get_streams(self):
-        if not self.options.get("username") or not self.options.get("password"):
-            self.logger.error("BTV requires registration, set the username and password"
-                              " with --btv-username and --btv-password")
-        elif self.login(self.options.get("username"), self.options.get("password")):
-            res = self.session.http.get(self.url)
-            media_match = self.media_id_re.search(res.text)
-            media_id = media_match and media_match.group(1)
-            if media_id:
-                self.logger.debug("Found media id: {0}", media_id)
-                stream_url = self.get_hls_url(media_id)
-                if stream_url:
-                    return HLSStream.parse_variant_playlist(self.session, stream_url)
-        else:
-            self.logger.error("Login failed, a valid username and password is required")
+        media_id = self.session.http.get(
+            self.url,
+            schema=validate.Schema(
+                re.compile(r"media_id=(\d+)"),
+                validate.any(None, validate.get(1)),
+            ),
+        )
+        if media_id is None:
+            return
+
+        stream_url = self.session.http.get(
+            self.URL_API,
+            params={
+                "media_id": media_id,
+            },
+            schema=validate.Schema(
+                validate.any(
+                    validate.all(
+                        validate.regex(re.compile(r"geo_blocked_stream")),
+                        validate.get(0),
+                    ),
+                    validate.all(
+                        validate.parse_json(),
+                        {
+                            "status": "ok",
+                            "info": {
+                                "file": validate.url(path=validate.endswith(".m3u8")),
+                            },
+                        },
+                        validate.get(("info", "file")),
+                    ),
+                ),
+            ),
+        )
+        if not stream_url:
+            return
+
+        if stream_url == "geo_blocked_stream":
+            log.error("The content is not available in your region")
+            return
+
+        return HLSStream.parse_variant_playlist(self.session, stream_url)
 
 
 __plugin__ = BTV

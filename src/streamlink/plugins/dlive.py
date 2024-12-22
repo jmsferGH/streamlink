@@ -1,62 +1,165 @@
+"""
+$description Global live-streaming platform owned by BitTorrent, Inc.
+$url dlive.tv
+$type live, vod
+$metadata id
+$metadata author
+$metadata category
+$metadata title
+"""
+
+import logging
 import re
+from textwrap import dedent
 
-from streamlink.plugin import Plugin, PluginError
-from streamlink.stream import HLSStream
-from streamlink.compat import unquote_plus, is_py3
-
-
-QUALITY_WEIGHTS = {
-   "src": 1080,
-}
+from streamlink.plugin import Plugin, pluginmatcher
+from streamlink.plugin.api import validate
+from streamlink.stream.hls import HLSStream
 
 
+log = logging.getLogger(__name__)
+
+
+class DLiveHLSStream(HLSStream):
+    URL_SIGN = "https://live.prd.dlive.tv/hls/sign/url"
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.args["url"] = self.session.http.post(
+            self.URL_SIGN,
+            json={"playlisturi": self.args["url"]},
+            schema=validate.Schema(validate.url()),
+        )
+
+
+@pluginmatcher(
+    name="live",
+    pattern=re.compile(
+        r"https?://(?:www\.)?dlive\.tv/(?P<channel>[^/?#]+)(?:$|[?#])",
+    ),
+)
+@pluginmatcher(
+    name="vod",
+    pattern=re.compile(
+        r"https?://(?:www\.)?dlive\.tv/p/(?P<video>[^/?#]+)(?:$|[?#])",
+    ),
+)
 class DLive(Plugin):
-    """
-    Plugin for dlive.tv
-    """
+    URL_API = "https://graphigo.prd.dlive.tv/"
+    URL_LIVE = "https://live.prd.dlive.tv/hls/live/{username}.m3u8"
 
-    _url_re = re.compile(r"https?://(?:www\.)?dlive\.tv/")
-    _playback_re = re.compile(r"""(?<=playbackUrl":")(.+?)(?=")""")
-    _livestream_re = re.compile(r""""livestream":null""")
-    _username_re = re.compile(r"(?<=user:)(\w|-)+")
-
-    @classmethod
-    def can_handle_url(cls, url):
-        return cls._url_re.match(url)
+    QUALITY_WEIGHTS = {
+        "src": 1080,
+    }
 
     @classmethod
     def stream_weight(cls, key):
-        weight = QUALITY_WEIGHTS.get(key)
+        weight = cls.QUALITY_WEIGHTS.get(key)
         if weight:
             return weight, "dlive"
 
-        return Plugin.stream_weight(key)
+        return super().stream_weight(key)
 
-    def _get_streams(self):
-        res = self.session.http.get(self.url)
+    def _get_streams_video(self, video):
+        log.debug(f"Getting video HLS streams for {video}")
 
-        m = self._playback_re.search(res.text)
-
-        if m:
-            hls_url = m.group(0)
-
-            if is_py3:
-                hls_url = bytes(unquote_plus(hls_url), "utf-8").decode(
-                    "unicode_escape")
-            else:
-                hls_url = unquote_plus(hls_url).decode("unicode_escape")
-        else:
-            if self._livestream_re.search(res.text) is not None:
-                raise PluginError('Stream is offline')
-
-            m = self._username_re.search(res.text)
-            if m:
-                hls_url = "https://live.prd.dlive.tv/hls/live/{}.m3u8".format(
-                    m.group(0))
-            else:
-                raise PluginError('Could not find username')
+        self.id = video
+        hls_url, self.author, self.category, self.title = self.session.http.post(
+            self.URL_API,
+            json={
+                "query": dedent(f"""
+                    query {{
+                        pastBroadcast(permlink:"{video}") {{
+                            playbackUrl
+                            creator {{
+                                username
+                            }}
+                            category {{
+                                title
+                            }}
+                            title
+                        }}
+                    }}
+                """),
+            },
+            schema=validate.Schema(
+                validate.parse_json(),
+                {
+                    "data": {
+                        "pastBroadcast": {
+                            "playbackUrl": validate.url(path=validate.endswith(".m3u8")),
+                            "creator": {
+                                "username": str,
+                            },
+                            "category": {
+                                "title": str,
+                            },
+                            "title": str,
+                        },
+                    },
+                },
+                validate.get(("data", "pastBroadcast")),
+                validate.union_get(
+                    "playbackUrl",
+                    ("creator", "username"),
+                    ("category", "title"),
+                    "title",
+                ),
+            ),
+        )
 
         return HLSStream.parse_variant_playlist(self.session, hls_url)
+
+    def _get_streams_live(self, channel):
+        log.debug(f"Getting live HLS streams for {channel}")
+
+        self.author = channel
+        username, self.title = self.session.http.post(
+            self.URL_API,
+            json={
+                "query": dedent(f"""
+                    query {{
+                        userByDisplayName(displayname:"{channel}") {{
+                            username
+                            livestream {{
+                                title
+                            }}
+                        }}
+                    }}
+                """),
+            },
+            schema=validate.Schema(
+                validate.parse_json(),
+                {
+                    "data": {
+                        "userByDisplayName": {
+                            "username": str,
+                            "livestream": {
+                                "title": str,
+                            },
+                        },
+                    },
+                },
+                validate.get(("data", "userByDisplayName")),
+                validate.union_get(
+                    "username",
+                    ("livestream", "title"),
+                ),
+            ),
+        )
+
+        return DLiveHLSStream.parse_variant_playlist(self.session, self.URL_LIVE.format(username=username))
+
+    def _get_streams(self):
+        self.session.http.headers.update({
+            "Origin": "https://dlive.tv",
+            "Referer": "https://dlive.tv/",
+        })
+
+        if self.matches["live"]:
+            return self._get_streams_live(self.match["channel"])
+        if self.matches["vod"]:
+            return self._get_streams_video(self.match["video"])
 
 
 __plugin__ = DLive

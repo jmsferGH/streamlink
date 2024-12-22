@@ -1,20 +1,32 @@
-import unittest
-
 from streamlink.plugins.gulli import Gulli
+from tests.plugins import PluginCanHandleUrl
 
 
-class TestPluginGulli(unittest.TestCase):
-    def test_can_handle_url(self):
-        # should match
-        self.assertTrue(Gulli.can_handle_url("http://replay.gulli.fr/Direct"))
-        self.assertTrue(Gulli.can_handle_url("http://replay.gulli.fr/dessins-animes/My-Little-Pony-les-amies-c-est-magique/VOD68328764799000"))
-        self.assertTrue(Gulli.can_handle_url("http://replay.gulli.fr/emissions/In-Ze-Boite2/VOD68639028668000"))
-        self.assertTrue(Gulli.can_handle_url("http://replay.gulli.fr/series/Power-Rangers-Dino-Super-Charge/VOD68612908435000"))
+class TestPluginCanHandleUrlGulli(PluginCanHandleUrl):
+    __plugin__ = Gulli
 
-        # shouldn't match
-        self.assertFalse(Gulli.can_handle_url("http://replay.gulli.fr/"))
-        self.assertFalse(Gulli.can_handle_url("http://replay.gulli.fr/dessins-animes"))
-        self.assertFalse(Gulli.can_handle_url("http://replay.gulli.fr/emissions"))
-        self.assertFalse(Gulli.can_handle_url("http://replay.gulli.fr/series"))
-        self.assertFalse(Gulli.can_handle_url("http://www.tvcatchup.com/"))
-        self.assertFalse(Gulli.can_handle_url("http://www.youtube.com/"))
+    should_match = [
+        (
+            "live",
+            "https://replay.gulli.fr/Direct",
+        ),
+        (
+            "vod",
+            "https://replay.gulli.fr/dessins-animes/Bob-l-eponge-s10/bob-l-eponge-s10-e05-un-bon-gros-dodo-vod69736581475000",
+        ),
+        (
+            "vod",
+            "https://replay.gulli.fr/emissions/Animaux-VIP-une-bete-de-reno-s02/animaux-vip-une-bete-de-reno-s02-e09-la-taniere-du-dragon-vod69634261609000",
+        ),
+        (
+            "vod",
+            "https://replay.gulli.fr/series/Black-Panther-Dangers-au-Wakanda/black-panther-dangers-au-wakanda-black-panther-dangers-au-wakanda-vod69941412154000",
+        ),
+    ]
+
+    should_not_match = [
+        "http://replay.gulli.fr/",
+        "http://replay.gulli.fr/dessins-animes",
+        "http://replay.gulli.fr/emissions",
+        "http://replay.gulli.fr/series",
+    ]

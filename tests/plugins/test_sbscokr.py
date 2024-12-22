@@ -1,19 +1,15 @@
-import unittest
-
 from streamlink.plugins.sbscokr import SBScokr
+from tests.plugins import PluginCanHandleUrl
 
 
-class TestPluginSBScokr(unittest.TestCase):
-    def test_can_handle_url(self):
-        should_match = [
-            'https://play.sbs.co.kr/onair/pc/index.html',
-            'http://play.sbs.co.kr/onair/pc/index.html',
-        ]
-        for url in should_match:
-            self.assertTrue(SBScokr.can_handle_url(url))
+class TestPluginCanHandleUrlSBScokr(PluginCanHandleUrl):
+    __plugin__ = SBScokr
 
-        should_not_match = [
-            'https://example.com/index.html',
-        ]
-        for url in should_not_match:
-            self.assertFalse(SBScokr.can_handle_url(url))
+    should_match_groups = [
+        # regular channels
+        ("https://www.sbs.co.kr/live/S01", {"channel": "S01"}),
+        ("https://www.sbs.co.kr/live/S01?div=live_list", {"channel": "S01"}),
+        # "virtual" channels
+        ("https://www.sbs.co.kr/live/S21", {"channel": "S21"}),
+        ("https://www.sbs.co.kr/live/S21?div=live_list", {"channel": "S21"}),
+    ]

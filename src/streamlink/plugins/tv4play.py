@@ -1,52 +1,52 @@
+"""
+$description Live TV channels and video on-demand service from TV4, a Swedish free-to-air broadcaster.
+$url tv4play.se
+$url fotbollskanalen.se
+$type live, vod
+$metadata title
+$region Sweden
+$notes Only non-premium streams are supported
+"""
+
 import logging
 import re
+from urllib.parse import urljoin
 
-from streamlink.compat import urljoin
-from streamlink.exceptions import PluginError
-from streamlink.plugin import Plugin
+from streamlink.plugin import Plugin, pluginmatcher
 from streamlink.plugin.api import validate
-from streamlink.stream import HLSStream
+from streamlink.stream.hls import HLSStream
+
 
 log = logging.getLogger(__name__)
 
 
+@pluginmatcher(
+    name="default",
+    pattern=re.compile(r"https?://(?:www\.)?tv4play\.se/program/[^?/]+/[^?/]+/(?P<video_id>\d+)"),
+)
+@pluginmatcher(
+    name="fotbollskanalen",
+    pattern=re.compile(r"https?://(?:www\.)?fotbollskanalen\.se/video/(?P<video_id>\d+)"),
+)
 class TV4Play(Plugin):
-    """Plugin for TV4 Play, swedish TV channel TV4's streaming service."""
-
-    title = None
     video_id = None
 
     api_url = "https://playback-api.b17g.net"
     api_assets = urljoin(api_url, "/asset/{0}")
 
-    _url_re = re.compile(r"""
-        https?://(?:www\.)?
-        (?:
-            tv4play.se/program/[^\?/]+
-            |
-            fotbollskanalen.se/video
-        )
-        /(?P<video_id>\d+)
-    """, re.VERBOSE)
-
     _meta_schema = validate.Schema(
         {
             "metadata": {
-                "title": validate.text
+                "title": str,
             },
-            "mediaUri": validate.text
-        }
+            "mediaUri": str,
+        },
     )
-
-    @classmethod
-    def can_handle_url(cls, url):
-        return cls._url_re.match(url) is not None
 
     @property
     def get_video_id(self):
         if self.video_id is None:
-            match = self._url_re.match(self.url)
-            self.video_id = match.group("video_id")
+            self.video_id = self.match.group("video_id")
             log.debug("Found video ID: {0}".format(self.video_id))
         return self.video_id
 
@@ -57,11 +57,14 @@ class TV4Play(Plugin):
             "service": "tv4",
         }
         try:
-            res = self.session.http.get(self.api_assets.format(self.get_video_id),
-                           params=params)
+            res = self.session.http.get(
+                self.api_assets.format(self.get_video_id),
+                params=params,
+            )
         except Exception as e:
             if "404 Client Error" in str(e):
-                raise PluginError("This Video is not available")
+                log.error("This Video is not available")
+                return
             raise e
         log.debug("Found metadata")
         metadata = self.session.http.json(res, schema=self._meta_schema)
@@ -80,16 +83,15 @@ class TV4Play(Plugin):
             res = self.session.http.get(urljoin(self.api_url, metadata["mediaUri"]))
         except Exception as e:
             if "401 Client Error" in str(e):
-                raise PluginError("This Video is not available in your country")
+                log.error("This Video is not available in your country")
+                return
             raise e
 
         log.debug("Found stream data")
         data = self.session.http.json(res)
         hls_url = data["playbackItem"]["manifestUrl"]
         log.debug("URL={0}".format(hls_url))
-        for s in HLSStream.parse_variant_playlist(self.session,
-                                                  hls_url).items():
-            yield s
+        yield from HLSStream.parse_variant_playlist(self.session, hls_url).items()
 
 
 __plugin__ = TV4Play

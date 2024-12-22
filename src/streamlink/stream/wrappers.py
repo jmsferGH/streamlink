@@ -1,8 +1,7 @@
-from ..buffers import Buffer, RingBuffer
-
+import io
 from threading import Thread
 
-import io
+from streamlink.buffers import Buffer, RingBuffer
 
 
 class StreamIOWrapper(io.IOBase):
@@ -52,7 +51,7 @@ class StreamIOThreadWrapper(io.IOBase):
 
     class Filler(Thread):
         def __init__(self, fd, buffer):
-            Thread.__init__(self)
+            super().__init__()
 
             self.error = None
             self.fd = fd
@@ -66,7 +65,7 @@ class StreamIOThreadWrapper(io.IOBase):
             while self.running:
                 try:
                     data = self.fd.read(8192)
-                except IOError as error:
+                except OSError as error:
                     self.error = error
                     break
 
@@ -99,8 +98,7 @@ class StreamIOThreadWrapper(io.IOBase):
         if self.filler.error and self.buffer.length == 0:
             raise self.filler.error
 
-        return self.buffer.read(size, block=self.filler.is_alive(),
-                                timeout=self.timeout)
+        return self.buffer.read(size, block=self.filler.is_alive(), timeout=self.timeout)
 
     def close(self):
         self.filler.stop()

@@ -1,38 +1,63 @@
+from __future__ import annotations
+
 import os
+import tempfile
+from pathlib import Path
 
-from streamlink import __version__ as LIVESTREAMER_VERSION
-from .compat import is_win32
+from streamlink.compat import is_darwin, is_win32
 
-DEFAULT_PLAYER_ARGUMENTS = u"{filename}"
+
 DEFAULT_STREAM_METADATA = {
-    "title": u"Unknown Title",
-    "author": u"Unknown Author",
-    "category": u"No Category",
-    "game": u"No Game/Category"
+    "id": "Unknown ID",
+    "title": "Unknown Title",
+    "author": "Unknown Author",
+    "category": "No Category",
+    "game": "No Game/Category",
 }
-SUPPORTED_PLAYERS = {  # these are the players that streamlink knows how to set the window title for with `--title`. key names are used in help text
-    # name: possible binary names (linux/mac and windows)
-    "vlc": ["vlc", "vlc.exe"],
-    "mpv": ["mpv", "mpv.exe"],
-    "potplayer": ["potplayer", "potplayermini64.exe", "potplayermini.exe"]
-}
+
+CONFIG_FILES: list[Path]
+PLUGIN_DIRS: list[Path]
+LOG_DIR: Path
 
 if is_win32:
-    APPDATA = os.environ["APPDATA"]
-    CONFIG_FILES = [os.path.join(APPDATA, "streamlink", "streamlinkrc")]
-    PLUGINS_DIR = os.path.join(APPDATA, "streamlink", "plugins")
-else:
-    XDG_CONFIG_HOME = os.environ.get("XDG_CONFIG_HOME", "~/.config")
+    APPDATA = Path(os.environ.get("APPDATA") or Path.home() / "AppData")
     CONFIG_FILES = [
-        os.path.expanduser(XDG_CONFIG_HOME + "/streamlink/config"),
-        os.path.expanduser("~/.streamlinkrc")
+        APPDATA / "streamlink" / "config",
     ]
-    PLUGINS_DIR = os.path.expanduser(XDG_CONFIG_HOME + "/streamlink/plugins")
+    PLUGIN_DIRS = [
+        APPDATA / "streamlink" / "plugins",
+    ]
+    LOG_DIR = Path(tempfile.gettempdir()) / "streamlink" / "logs"
+elif is_darwin:
+    XDG_CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME", "~/.config")).expanduser()
+    CONFIG_FILES = [
+        Path.home() / "Library" / "Application Support" / "streamlink" / "config",
+    ]
+    PLUGIN_DIRS = [
+        Path.home() / "Library" / "Application Support" / "streamlink" / "plugins",
+    ]
+    LOG_DIR = Path.home() / "Library" / "Logs" / "streamlink"
+else:
+    XDG_CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME", "~/.config")).expanduser()
+    XDG_DATA_HOME = Path(os.environ.get("XDG_DATA_HOME", "~/.local/share")).expanduser()
+    XDG_STATE_HOME = Path(os.environ.get("XDG_STATE_HOME", "~/.local/state")).expanduser()
+    CONFIG_FILES = [
+        XDG_CONFIG_HOME / "streamlink" / "config",
+    ]
+    PLUGIN_DIRS = [
+        XDG_DATA_HOME / "streamlink" / "plugins",
+    ]
+    LOG_DIR = XDG_STATE_HOME / "streamlink" / "logs"
 
 STREAM_SYNONYMS = ["best", "worst", "best-unfiltered", "worst-unfiltered"]
-STREAM_PASSTHROUGH = ["hls", "http", "rtmp"]
+STREAM_PASSTHROUGH = ["hls", "http"]
+
 
 __all__ = [
-    "CONFIG_FILES", "DEFAULT_PLAYER_ARGUMENTS", "LIVESTREAMER_VERSION",
-    "PLUGINS_DIR", "STREAM_SYNONYMS", "STREAM_PASSTHROUGH"
+    "CONFIG_FILES",
+    "DEFAULT_STREAM_METADATA",
+    "LOG_DIR",
+    "PLUGIN_DIRS",
+    "STREAM_PASSTHROUGH",
+    "STREAM_SYNONYMS",
 ]

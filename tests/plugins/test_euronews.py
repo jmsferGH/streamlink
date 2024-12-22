@@ -1,27 +1,24 @@
-import unittest
-
 from streamlink.plugins.euronews import Euronews
+from tests.plugins import PluginCanHandleUrl
 
 
-class TestPluginEuronews(unittest.TestCase):
-    def test_can_handle_url(self):
-        # should match
-        self.assertTrue(Euronews.can_handle_url("http://www.euronews.com/live"))
-        self.assertTrue(Euronews.can_handle_url("http://fr.euronews.com/live"))
-        self.assertTrue(Euronews.can_handle_url("http://de.euronews.com/live"))
-        self.assertTrue(Euronews.can_handle_url("http://it.euronews.com/live"))
-        self.assertTrue(Euronews.can_handle_url("http://es.euronews.com/live"))
-        self.assertTrue(Euronews.can_handle_url("http://pt.euronews.com/live"))
-        self.assertTrue(Euronews.can_handle_url("http://ru.euronews.com/live"))
-        self.assertTrue(Euronews.can_handle_url("http://ua.euronews.com/live"))
-        self.assertTrue(Euronews.can_handle_url("http://tr.euronews.com/live"))
-        self.assertTrue(Euronews.can_handle_url("http://gr.euronews.com/live"))
-        self.assertTrue(Euronews.can_handle_url("http://hu.euronews.com/live"))
-        self.assertTrue(Euronews.can_handle_url("http://fa.euronews.com/live"))
-        self.assertTrue(Euronews.can_handle_url("http://arabic.euronews.com/live"))
-        self.assertTrue(Euronews.can_handle_url("http://www.euronews.com/2017/05/10/peugeot-expects-more-opel-losses-this-year"))
-        self.assertTrue(Euronews.can_handle_url("http://fr.euronews.com/2017/05/10/l-ag-de-psa-approuve-le-rachat-d-opel"))
+class TestPluginCanHandleUrlEuronews(PluginCanHandleUrl):
+    __plugin__ = Euronews
 
-        # shouldn't match
-        self.assertFalse(Euronews.can_handle_url("http://www.tvcatchup.com/"))
-        self.assertFalse(Euronews.can_handle_url("http://www.youtube.com/"))
+    should_match = [
+        "https://www.euronews.com/live",
+        "https://fr.euronews.com/live",
+        "https://de.euronews.com/live",
+        "https://it.euronews.com/live",
+        "https://es.euronews.com/live",
+        "https://pt.euronews.com/live",
+        "https://ru.euronews.com/live",
+        "https://ua.euronews.com/live",
+        "https://tr.euronews.com/live",
+        "https://gr.euronews.com/live",
+        "https://hu.euronews.com/live",
+        "https://fa.euronews.com/live",
+        "https://arabic.euronews.com/live",
+        "https://www.euronews.com/video",
+        "https://www.euronews.com/2023/01/02/giving-europe-a-voice-television-news-network-euronews-turns-30",
+    ]

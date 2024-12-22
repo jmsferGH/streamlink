@@ -1,19 +1,20 @@
-import unittest
-
 from streamlink.plugins.vimeo import Vimeo
+from tests.plugins import PluginCanHandleUrl
 
 
-class TestPluginVimeo(unittest.TestCase):
-    def test_can_handle_url(self):
-        # should match
-        self.assertTrue(Vimeo.can_handle_url("https://vimeo.com/237163735"))
-        self.assertTrue(Vimeo.can_handle_url("https://vimeo.com/channels/music/176894130"))
-        self.assertTrue(Vimeo.can_handle_url("https://vimeo.com/album/3706071/video/148903960"))
-        self.assertTrue(Vimeo.can_handle_url("https://vimeo.com/ondemand/surveyopenspace/92630739"))
-        self.assertTrue(Vimeo.can_handle_url("https://vimeo.com/ondemand/100footsurfingdays"))
-        self.assertTrue(Vimeo.can_handle_url("https://player.vimeo.com/video/176894130"))
+class TestPluginCanHandleUrlVimeo(PluginCanHandleUrl):
+    __plugin__ = Vimeo
 
-        # shouldn't match
-        self.assertFalse(Vimeo.can_handle_url("https://www.vimeo.com/"))
-        self.assertFalse(Vimeo.can_handle_url("http://www.tvcatchup.com/"))
-        self.assertFalse(Vimeo.can_handle_url("http://www.youtube.com/"))
+    should_match_groups = [
+        (("default", "https://vimeo.com/783455878"), {}),
+        (("default", "https://vimeo.com/channels/music/176894130"), {}),
+        (("default", "https://vimeo.com/ondemand/worldoftomorrow3/467204924"), {}),
+        (("default", "https://vimeo.com/ondemand/100footsurfingdays"), {}),
+        (("player", "https://player.vimeo.com/video/176894130"), {}),
+        (("event", "https://vimeo.com/event/4154130"), {"event_id": "4154130"}),
+        (("event", "https://vimeo.com/event/4154130/embed"), {"event_id": "4154130"}),
+    ]
+
+    should_not_match = [
+        "https://www.vimeo.com/",
+    ]

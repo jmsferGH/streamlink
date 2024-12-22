@@ -1,6 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
 import os
 import sys
 
@@ -14,20 +12,27 @@ sys.path.insert(0, os.path.abspath('.'))
 # -- General configuration -----------------------------------------------------
 
 # If your documentation needs a minimal Sphinx version, state it here.
-#needs_sphinx = '1.0'
+needs_sphinx = '3.0'
 
 # Add any Sphinx extension module names here, as strings. They can be extensions
 # coming with Sphinx (named 'sphinx.ext.*') or your custom ones.
-extensions = ['sphinx.ext.autodoc', 'ext_argparse', 'ext_github', 'ext_releaseref']
+extensions = [
+    'sphinx.ext.autodoc',
+    'sphinx.ext.autosectionlabel',
+    'sphinx.ext.intersphinx',
+    'ext_html_template_vars',
+    'ext_argparse',
+    'ext_github',
+    'ext_plugins',
+    'ext_releaseref',
+    'myst_parser',
+    'sphinx_design',
+]
+
+autosectionlabel_prefix_document = True
 
 # Add any paths that contain templates here, relative to this directory.
 templates_path = ['_templates']
-
-# The suffix of source filenames.
-source_suffix = ['.rst', '.md']
-source_parsers = {
-   '.md': 'recommonmark.parser.CommonMarkParser',
-}
 
 # The encoding of source files.
 #source_encoding = 'utf-8-sig'
@@ -37,7 +42,7 @@ master_doc = 'index'
 
 # General information about the project.
 project = 'Streamlink'
-copyright = '2019, Streamlink'
+copyright = '2024, Streamlink'
 
 # The version info for the project you're documenting, acts as replacement for
 # |version| and |release|, also used in various other places throughout the
@@ -85,33 +90,55 @@ exclude_patterns = ['_build', '_applications.rst']
 
 github_project = 'streamlink/streamlink'
 
-# -- Options for HTML output ---------------------------------------------------
 
-sys.path.append(os.path.abspath('_themes'))
+# -- Options for autodoc ---------------------------------------------------
 
-html_theme_path = ['_themes']
-html_theme = 'sphinx_rtd_theme_violet'
-html_theme_options = {
-    "oneliner": (
-        "Command-line utility that extracts streams from various services "
-        "and pipes them into a video player of choice."
-    ),
-    "github_user": "streamlink",
-    "github_repo": "streamlink",
-    "sticky_navigation": True
+autodoc_default_options = {
+    "show-inheritance": True,
+    "members": True,
+    "member-order": "groupwise",  # autodoc_member_order
+    "class-doc-from": "both",  # autoclass_content
 }
+autodoc_inherit_docstrings = False
+autodoc_typehints = "description"
+
+
+# -- Options for intersphinx ---------------------------------------------------
+
+intersphinx_mapping = {
+    # "python": ("https://docs.python.org/3", None),
+    "requests": ("https://requests.readthedocs.io/en/stable/", None),
+}
+
+intersphinx_timeout = 60
+
+
+# -- Options for HTML output ---------------------------------------------------
 
 # The theme to use for HTML and HTML Help pages.  See the documentation for
 # a list of builtin themes.
-#html_theme = 'default'
+html_theme = 'furo'
 
 # Theme options are theme-specific and customize the look and feel of a theme
 # further.  For a list of options available for each theme, see the
 # documentation.
-# html_theme_options = { "github_fork": "streamlink/streamlink" }
+html_theme_options = {
+    "source_repository": "https://github.com/streamlink/streamlink/",
+    "source_branch": "master",
+    "source_directory": "docs/",
+    "light_logo": "icon.svg",
+    "dark_logo": "icon.svg",
+}
 
 # Add any paths that contain custom themes here, relative to this directory.
 #html_theme_path = []
+
+# HTML template variables via the custom ext_html_template_vars extension
+html_template_vars = {
+    "oneliner": (
+        "A command-line utility that extracts streams from various services and pipes them into a video player of choice."
+    ),
+}
 
 # The name for this set of Sphinx documents.  If None, it defaults to
 # "<project> v<release> documentation".
@@ -122,7 +149,7 @@ html_theme_options = {
 
 # The name of an image file (relative to this directory) to place at the top
 # of the sidebar.
-#html_logo = None
+html_logo = "../icon.svg"
 
 # The name of an image file (within the static path) to use as favicon of the
 # docs.  This file should be a Windows icon file (.ico) being 16x16 or 32x32
@@ -132,20 +159,30 @@ html_theme_options = {
 # Add any paths that contain custom static files (such as style sheets) here,
 # relative to this directory. They are copied after the builtin static files,
 # so a file named "default.css" will overwrite the builtin "default.css".
-#html_static_path = ['_static']
+html_static_path = ['_static']
+
+html_css_files = [
+    "styles/custom.css",
+    "https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.3.0/css/fontawesome.min.css",
+    "https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.3.0/css/solid.min.css",
+    "https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.3.0/css/brands.min.css",
+]
 
 # If not '', a 'Last updated on:' timestamp is inserted at every page bottom,
 # using the given strftime format.
 #html_last_updated_fmt = '%b %d, %Y'
 
 # Custom sidebar templates, maps document names to template names.
-#html_sidebars = {}
-
-# html_sidebars = {
-#    'index': ['sidebarintro.html', 'sourcelink.html', 'searchbox.html'],
-#    '**': ['sidebarlogo.html', 'localtoc.html', 'relations.html',
-#           'sourcelink.html', 'searchbox.html']
-#}
+html_sidebars = {
+    '**': [
+        'sidebar/scroll-start.html',
+        'sidebar/brand.html',
+        'sidebar/search.html',
+        'sidebar/navigation.html',
+        'sidebar/github-buttons.html',
+        'sidebar/scroll-end.html',
+    ]
+}
 
 # Additional templates that should be rendered to pages, maps page names to
 # template names.
@@ -182,11 +219,25 @@ htmlhelp_basename = 'streamlinkdoc'
 
 # -- Options for manual page output --------------------------------------------
 
+# Only include the man page in builds with the "man" tag set: via `-t man` (see Makefile)
+if "man" not in tags:  # type: ignore[name-defined]
+    exclude_patterns.append("_man.rst")
+
 # One entry per manual page. List of tuples
 # (source start file, name, description, authors, manual section).
 man_pages = [
-    ('cli', 'streamlink', 'extracts streams from various services and pipes them into a video player of choice', ['Streamlink Contributors'], 1)
+    (
+        "_man",
+        "streamlink",
+        "extracts streams from various services and pipes them into a video player of choice",
+        ["Streamlink Contributors"],
+        1,
+    ),
 ]
 
 # If true, show URL addresses after external links.
 #man_show_urls = False
+
+# If true, make a section directory on build man page.
+# Always set this to false to fix inconsistencies between recent sphinx releases
+man_make_section_directory = False

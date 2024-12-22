@@ -1,154 +1,223 @@
 """
-Plugin for Czech TV (Ceska televize).
-
-Following channels are working:
-    * CT1 - https://www.ceskatelevize.cz/porady/ct1/
-    * CT2 - https://www.ceskatelevize.cz/porady/ct2/
-    * CT24 - https://ct24.ceskatelevize.cz/#live
-    * CT sport - https://www.ceskatelevize.cz/sport/zive-vysilani/
-    * CT Decko - https://decko.ceskatelevize.cz/zive
-    * CT Art - https://www.ceskatelevize.cz/porady/art/
-
-Additionally, videos from iVysilani archive should work as well.
+$description Live TV channels from CT, a Czech public, state-owned broadcaster.
+$url ceskatelevize.cz
+$type live
+$metadata id
+$metadata title
+$region Czechia
 """
+
+import json
 import logging
 import re
+from urllib.parse import urlparse
 
-from streamlink.plugin import Plugin
-from streamlink.plugin.api import useragents, validate
-from streamlink.stream import HLSStream
-from streamlink.exceptions import PluginError
+from streamlink.plugin import Plugin, pluginmatcher
+from streamlink.plugin.api import validate
+from streamlink.stream.dash import DASHStream
 
-_url_re = re.compile(
-    r'http(s)?://([^.]*.)?ceskatelevize.cz'
-)
-_player_re = re.compile(
-    r'ivysilani/embed/iFramePlayer[^"]+'
-)
-_hash_re = re.compile(
-    r'hash:"([0-9a-z]+)"'
-)
-_playlist_info_re = re.compile(
-    r'{"type":"([a-z]+)","id":"([0-9]+)"'
-)
-_playlist_url_schema = validate.Schema({
-    validate.optional("streamingProtocol"): validate.text,
-    "url": validate.any(
-        validate.url(),
-        "Error",
-        "error_region"
-    )
-})
-_playlist_schema = validate.Schema({
-    "playlist": [{
-        validate.optional("type"): validate.text,
-        "streamUrls": {
-            "main": validate.url(),
-        }
-    }]
-})
 
 log = logging.getLogger(__name__)
 
 
-def _find_playlist_info(response):
-    """
-    Finds playlist info (type, id) in HTTP response.
-
-    :param response: Response object.
-    :returns: Dictionary with type and id.
-    """
-    values = {}
-    matches = _playlist_info_re.search(response.text)
-    if matches:
-        values['type'] = matches.group(1)
-        values['id'] = matches.group(2)
-
-    return values
-
-
-def _find_player_url(response):
-    """
-    Finds embedded player url in HTTP response.
-
-    :param response: Response object.
-    :returns: Player url (str).
-    """
-    url = ''
-    matches = _player_re.search(response.text)
-    if matches:
-        tmp_url = matches.group(0).replace('&amp;', '&')
-        if 'hash' not in tmp_url:
-            # there's no hash in the URL, try to find it
-            matches = _hash_re.search(response.text)
-            if matches:
-                url = tmp_url + '&hash=' + matches.group(1)
-        else:
-            url = tmp_url
-
-    return 'http://ceskatelevize.cz/' + url
-
-
+@pluginmatcher(re.compile(r"https?://ct24\.ceskatelevize\.cz/"))
+@pluginmatcher(re.compile(r"https?://decko\.ceskatelevize\.cz/"))
+@pluginmatcher(re.compile(r"https?://sport\.ceskatelevize\.cz/"))
+@pluginmatcher(re.compile(r"https?://(?:www\.)?ceskatelevize\.cz/zive/\w+"))
 class Ceskatelevize(Plugin):
+    schema_playlist = {
+        "playlist": [
+            {
+                "streamUrls": {
+                    "main": validate.url(),
+                },
+            },
+        ],
+    }
 
-    ajax_url = 'https://www.ceskatelevize.cz/ivysilani/ajax/get-client-playlist'
-
-    @classmethod
-    def can_handle_url(cls, url):
-        return _url_re.match(url)
-
-    def _get_streams(self):
-        self.session.http.headers.update({'User-Agent': useragents.IPAD})
-        self.session.http.verify = False
-        log.warning('SSL certificate verification is disabled.')
-        # fetch requested url and find playlist info
-        response = self.session.http.get(self.url)
-        info = _find_playlist_info(response)
-
-        if not info:
-            # playlist info not found, let's try to find player url
-            player_url = _find_player_url(response)
-            if not player_url:
-                raise PluginError('Cannot find playlist info or player url!')
-
-            # get player url and try to find playlist info in it
-            response = self.session.http.get(player_url)
-            info = _find_playlist_info(response)
-            if not info:
-                raise PluginError('Cannot find playlist info in the player url!')
-
-        log.trace('{0!r}'.format(info))
-
-        data = {
-            'playlist[0][type]': info['type'],
-            'playlist[0][id]': info['id'],
-            'requestUrl': '/ivysilani/embed/iFramePlayer.php',
-            'requestSource': 'iVysilani',
-            'type': 'html'
-        }
-        headers = {
-            'x-addr': '127.0.0.1',
-        }
-
-        # fetch playlist url
-        response = self.session.http.post(
-            self.ajax_url,
-            data=data,
-            headers=headers
+    def get_stream_url(self, video_id):
+        url = self.session.http.post(
+            "https://www.ceskatelevize.cz/ivysilani/ajax/get-client-playlist/",
+            data={
+                "playlist[0][type]": "channel",
+                "playlist[0][id]": video_id,
+                "requestUrl": "/ivysilani/embed/iFramePlayer.php",
+                "requestSource": "iVysilani",
+                "type": "html",
+                "canPlayDRM": "false",
+            },
+            schema=validate.Schema(
+                validate.parse_json(),
+                {
+                    "url": validate.url(),
+                },
+                validate.get("url"),
+            ),
         )
-        json_data = self.session.http.json(response, schema=_playlist_url_schema)
-        log.trace('{0!r}'.format(json_data))
 
-        if json_data['url'] in ['Error', 'error_region']:
-            log.error('This stream is not available')
+        return self.session.http.get(
+            url,
+            schema=validate.Schema(
+                validate.parse_json(),
+                self.schema_playlist,
+                validate.get(("playlist", 0, "streamUrls", "main")),
+            ),
+        )
+
+    def get_ct24(self):
+        self.id = 24
+        self.title = "ČT24"
+        return self.get_stream_url(self.id)
+
+    def get_decko(self):
+        self.id = 5
+        self.title = "Déčko"
+        return self.get_stream_url(self.id)
+
+    def get_sport(self, content):
+        video_id, key, date = validate.Schema(
+            validate.parse_html(),
+            validate.xml_xpath_string(".//section[@id='live']/@data-ctcomp-data"),
+            str,
+            validate.parse_json(),
+            {
+                "items": [
+                    {
+                        "items": [
+                            {
+                                validate.optional("video"): {
+                                    "data": {
+                                        "source": {
+                                            "playlist": [
+                                                {
+                                                    "id": int,
+                                                    "key": str,
+                                                    "date": str,
+                                                    "noDrmData": {
+                                                        "id": int,
+                                                        "key": str,
+                                                        "drm": int,
+                                                        "quality": str,
+                                                        "assetId": str,
+                                                    },
+                                                },
+                                            ],
+                                        },
+                                    },
+                                },
+                            },
+                        ],
+                    },
+                ],
+            },
+            validate.get(("items", 0, "items", 0, "video", "data", "source", "playlist", 0)),
+            validate.union_get(("noDrmData", "id"), ("noDrmData", "key"), "date"),
+        ).validate(content)
+
+        self.id = video_id
+        self.title = "ČT sport"
+
+        return self.session.http.post(
+            "https://playlist.ceskatelevize.cz/",
+            data={
+                "data": json.dumps(
+                    {
+                        "contentType": "live",
+                        "items": [
+                            {
+                                "id": video_id,
+                                "key": f"{key}",
+                                "assetId": "CT4DRM",
+                                "playerType": "dash",
+                                "date": f"{date}",
+                                "requestSource": "front-sport",
+                                "drm": 0,
+                                "quality": "web",
+                            },
+                        ],
+                    },
+                    separators=(",", ":"),
+                ),
+            },
+            schema=validate.Schema(
+                validate.parse_json(),
+                {
+                    "RESULT": self.schema_playlist,
+                },
+                validate.get(("RESULT", "playlist", 0, "streamUrls", "main")),
+            ),
+        )
+
+    def get_channel(self, content):
+        data = validate.Schema(
+            validate.parse_html(),
+            validate.xml_xpath_string(".//script[@id='__NEXT_DATA__'][text()]/text()"),
+            str,
+            validate.parse_json(),
+            {
+                "props": {
+                    "pageProps": {
+                        validate.optional("data"): {
+                            "liveBroadcast": {
+                                "id": str,
+                                "current": validate.none_or_all(
+                                    {
+                                        "id": str,
+                                        "channelName": str,
+                                        "isPlayable": bool,
+                                    },
+                                ),
+                                "next": validate.none_or_all(
+                                    {
+                                        "id": str,
+                                        "channelName": str,
+                                        "isPlayable": bool,
+                                    },
+                                ),
+                            },
+                        },
+                    },
+                },
+            },
+            validate.get(("props", "pageProps")),
+        ).validate(content)
+
+        if not data:
             return
 
-        # fetch playlist
-        response = self.session.http.post(json_data['url'])
-        json_data = self.session.http.json(response, schema=_playlist_schema)
-        log.trace('{0!r}'.format(json_data))
-        playlist = json_data['playlist'][0]['streamUrls']['main']
-        return HLSStream.parse_variant_playlist(self.session, playlist)
+        log.debug(f"data={data}")
+        data = data.get("data").get("liveBroadcast")
+        self.id = data.get("id")
+
+        data = data.get("current") or data.get("next")
+        if not data:
+            return
+
+        self.title = data.get("channelName")
+
+        return self.get_stream_url(self.id)
+
+    def _get_streams(self):
+        res = self.session.http.get(self.url)
+
+        if "://ct24" in res.url:
+            url = self.get_ct24()
+        elif "://decko" in res.url:
+            url = self.get_decko()
+        elif "://sport" in res.url:
+            url = self.get_sport(res.content)
+        else:
+            url = self.get_channel(res.content)
+
+        if url:
+            res = self.session.http.head(url, allow_redirects=True)
+            log.debug(f"res.url={res.url}")
+            p = urlparse(res.url).path
+            if not p.split("/")[-1].startswith(str(self.id)):
+                log.error("This stream is not available")
+                return
+            else:
+                return DASHStream.parse_manifest(self.session, res.url)
 
 
 __plugin__ = Ceskatelevize

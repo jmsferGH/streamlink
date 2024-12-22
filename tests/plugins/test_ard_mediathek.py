@@ -1,21 +1,51 @@
-import unittest
+from streamlink.plugins.ard_mediathek import ARDMediathek
+from tests.plugins import PluginCanHandleUrl
 
-from streamlink.plugins.ard_mediathek import ard_mediathek
 
+class TestPluginCanHandleUrlARDMediathek(PluginCanHandleUrl):
+    __plugin__ = ARDMediathek
 
-class TestPluginard_mediathek(unittest.TestCase):
-    def test_can_handle_url(self):
-        should_match = [
-            'http://mediathek.daserste.de/live',
-            'http://www.ardmediathek.de/tv/Sportschau/'
-        ]
-        for url in should_match:
-            self.assertTrue(ard_mediathek.can_handle_url(url))
-
-    def test_can_handle_url_negative(self):
-        should_not_match = [
-            'https://daserste.de/live/index.html',
-            'https://www.daserste.de/live/index.html',
-        ]
-        for url in should_not_match:
-            self.assertFalse(ard_mediathek.can_handle_url(url))
+    should_match_groups = [
+        (
+            (
+                "live",
+                "https://www.ardmediathek.de/live/Y3JpZDovL2Rhc2Vyc3RlLmRlL2xpdmUvY2xpcC9hYmNhMDdhMy0zNDc2LTQ4NTEtYjE2Mi1mZGU4ZjY0NmQ0YzQ",
+            ),
+            {"id_live": "Y3JpZDovL2Rhc2Vyc3RlLmRlL2xpdmUvY2xpcC9hYmNhMDdhMy0zNDc2LTQ4NTEtYjE2Mi1mZGU4ZjY0NmQ0YzQ"},
+        ),
+        (
+            (
+                "live",
+                "https://www.ardmediathek.de/live/Y3JpZDovL2Rhc2Vyc3RlLmRlL2xpdmUvY2xpcC9hYmNhMDdhMy0zNDc2LTQ4NTEtYjE2Mi1mZGU4ZjY0NmQ0YzQ?toolbarType=default",
+            ),
+            {"id_live": "Y3JpZDovL2Rhc2Vyc3RlLmRlL2xpdmUvY2xpcC9hYmNhMDdhMy0zNDc2LTQ4NTEtYjE2Mi1mZGU4ZjY0NmQ0YzQ"},
+        ),
+        (
+            (
+                "live",
+                "https://www.ardmediathek.de/live/tagesschau24/Y3JpZDovL2Rhc2Vyc3RlLmRlL3RhZ2Vzc2NoYXUvbGl2ZXN0cmVhbQ",
+            ),
+            {"id_live": "Y3JpZDovL2Rhc2Vyc3RlLmRlL3RhZ2Vzc2NoYXUvbGl2ZXN0cmVhbQ"},
+        ),
+        (
+            (
+                "video",
+                "https://www.ardmediathek.de/video/Y3JpZDovL2Rhc2Vyc3RlLmRlL3RhZ2Vzc2NoYXUvOWE4NGIzODgtZDEzNS00ZWU0LWI4ODEtZDYyNTQzYjg3ZmJlLzE",
+            ),
+            {"id_video": "Y3JpZDovL2Rhc2Vyc3RlLmRlL3RhZ2Vzc2NoYXUvOWE4NGIzODgtZDEzNS00ZWU0LWI4ODEtZDYyNTQzYjg3ZmJlLzE"},
+        ),
+        (
+            (
+                "video",
+                "https://www.ardmediathek.de/video/arte/blackfish-der-killerwal/arte/Y3JpZDovL2FydGUudHYvdmlkZW9zLzA1MDMyNy0wMDAtQQ",
+            ),
+            {"id_video": "Y3JpZDovL2FydGUudHYvdmlkZW9zLzA1MDMyNy0wMDAtQQ"},
+        ),
+        (
+            (
+                "video",
+                "https://www.ardmediathek.de/video/expeditionen-ins-tierreich/die-revolte-der-schimpansen/ndr/Y3JpZDovL25kci5kZS9jY2E3M2MzZS00ZTljLTRhOWItODE3MC05MjhjM2MwNWEyMDM?toolbarType=default",
+            ),
+            {"id_video": "Y3JpZDovL25kci5kZS9jY2E3M2MzZS00ZTljLTRhOWItODE3MC05MjhjM2MwNWEyMDM"},
+        ),
+    ]

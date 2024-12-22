@@ -1,20 +1,22 @@
-import unittest
-
 from streamlink.plugins.raiplay import RaiPlay
+from tests.plugins import PluginCanHandleUrl
 
 
-class TestPluginRaiPlay(unittest.TestCase):
-    def test_can_handle_url(self):
-        # should match
-        self.assertTrue(RaiPlay.can_handle_url("http://www.raiplay.it/dirette/rai1"))
-        self.assertTrue(RaiPlay.can_handle_url("http://www.raiplay.it/dirette/rai2"))
-        self.assertTrue(RaiPlay.can_handle_url("http://www.raiplay.it/dirette/rai3"))
-        self.assertTrue(RaiPlay.can_handle_url("http://raiplay.it/dirette/rai3"))
-        self.assertTrue(RaiPlay.can_handle_url("https://raiplay.it/dirette/rai3"))
-        self.assertTrue(RaiPlay.can_handle_url("http://www.raiplay.it/dirette/rainews24"))
-        self.assertTrue(RaiPlay.can_handle_url("https://www.raiplay.it/dirette/rainews24"))
+class TestPluginCanHandleUrlRaiPlay(PluginCanHandleUrl):
+    __plugin__ = RaiPlay
 
-        # shouldn't match
-        self.assertFalse(RaiPlay.can_handle_url("http://www.adultswim.com/videos/streams/toonami"))
-        self.assertFalse(RaiPlay.can_handle_url("http://www.tvcatchup.com/"))
-        self.assertFalse(RaiPlay.can_handle_url("http://www.youtube.com/"))
+    should_match = [
+        ("live", "https://raiplay.it/dirette/rai1"),
+        ("live", "https://www.raiplay.it/dirette/rai1"),
+        ("live", "https://www.raiplay.it/dirette/rai2"),
+        ("live", "https://www.raiplay.it/dirette/rai3"),
+        ("live", "https://www.raiplay.it/dirette/rainews24"),
+        (
+            "vod",
+            "https://raiplay.it/video/2023/11/Un-posto-al-sole---Puntata-del-08112023-EP6313-1377bcf9-db3f-40f7-aa05-fefeb086ec68.html",
+        ),
+        (
+            "vod",
+            "https://www.raiplay.it/video/2023/11/Un-posto-al-sole---Puntata-del-08112023-EP6313-1377bcf9-db3f-40f7-aa05-fefeb086ec68.html",
+        ),
+    ]

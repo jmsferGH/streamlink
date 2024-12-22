@@ -1,42 +1,51 @@
-import logging
+"""
+$description Live TV channels from LRT, a Lithuanian public, state-owned broadcaster.
+$url lrt.lt
+$type live
+"""
+
 import re
-from functools import partial
 
-from streamlink.plugin import Plugin
-from streamlink.stream import HLSStream
-from streamlink.utils import parse_json
-from streamlink.compat import urlparse
-
-log = logging.getLogger(__name__)
+from streamlink.plugin import Plugin, pluginmatcher
+from streamlink.plugin.api import validate
+from streamlink.stream.hls import HLSStream
 
 
+@pluginmatcher(
+    re.compile(r"https?://(?:www\.)?lrt\.lt/mediateka/tiesiogiai/"),
+)
 class LRT(Plugin):
-    _url_re = re.compile(r"https?://(?:www\.)?lrt.lt/mediateka/.")
-    _source_re = re.compile(r'sources\s*:\s*(\[{.*?}\]),', re.DOTALL | re.IGNORECASE)
-    js_to_json = partial(re.compile(r'(?!<")(\w+)\s*:\s*(["\']|\d?\.?\d+,|true|false|\[|{)').sub, r'"\1":\2')
-
-
-    @classmethod
-    def can_handle_url(cls, url):
-        return cls._url_re.match(url)
-
     def _get_streams(self):
-        page = self.session.http.get(self.url)
-        m = self._source_re.search(page.text)
-        if m:
-            params = ""
-            data = m.group(1)
-            log.debug("Source data: {0}".format(data))
-            if "location.hash.substring" in data:
-                log.debug("Removing hash substring addition")
-                data = re.sub(r"\s*\+\s*location.hash.substring\(\d+\)", "", data)
-                params = urlparse(self.url).fragment
-            data = self.js_to_json(data)
-            for stream in parse_json(data):
-                for s in HLSStream.parse_variant_playlist(self.session, stream['file'], params=params).items():
-                    yield s
-        else:
-            log.debug("No match for sources regex")
+        token_url = self.session.http.get(
+            self.url,
+            schema=validate.Schema(
+                re.compile(r"""var\s+tokenURL\s*=\s*(?P<q>["'])(?P<url>https://\S+)(?P=q)"""),
+                validate.none_or_all(validate.get("url")),
+            ),
+        )
+        if not token_url:
+            return
+
+        hls_url = self.session.http.get(
+            token_url,
+            schema=validate.Schema(
+                validate.parse_json(),
+                {
+                    "response": {
+                        "data": {
+                            "content": validate.all(
+                                str,
+                                validate.transform(lambda url: url.strip()),
+                                validate.url(path=validate.endswith(".m3u8")),
+                            ),
+                        },
+                    },
+                },
+                validate.get(("response", "data", "content")),
+            ),
+        )
+
+        return HLSStream.parse_variant_playlist(self.session, hls_url)
 
 
 __plugin__ = LRT

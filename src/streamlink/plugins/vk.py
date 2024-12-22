@@ -1,105 +1,148 @@
-# -*- coding: utf-8 -*-
+"""
+$description Russian live-streaming and video hosting social platform.
+$url vk.com
+$url vk.ru
+$type live, vod
+$metadata id
+$metadata author
+$metadata title
+"""
+
 import logging
 import re
+from hashlib import md5
+from urllib.parse import parse_qsl, unquote, urlparse, urlunparse
 
-from streamlink.compat import urlparse, unquote
-from streamlink.plugin import Plugin
-from streamlink.plugin.api import useragents
-from streamlink.plugin.api.utils import itertags
-from streamlink.stream import HTTPStream, HLSStream
-from streamlink.utils import update_scheme
+from streamlink.exceptions import NoStreamsError
+from streamlink.plugin import Plugin, PluginError, pluginmatcher
+from streamlink.plugin.api import validate
+from streamlink.stream.dash import DASHStream
+from streamlink.stream.hls import HLSStream
+from streamlink.utils.url import update_qsd
+
 
 log = logging.getLogger(__name__)
 
 
+@pluginmatcher(
+    name="video",
+    pattern=re.compile(r"https?://(?:\w+\.)?vk\.(?:com|ru)/video(?P<id>-?\d+_\d+)"),
+)
+@pluginmatcher(
+    name="default",
+    pattern=re.compile(r"https?://(\w+\.)?vk\.(?:com|ru)/(?!video-?\d+_\d+).+"),
+)
 class VK(Plugin):
+    API_URL = "https://vk.com/al_video.php"
+    HASH_COOKIE = "hash429"
 
-    API_URL = 'https://vk.com/al_video.php'
+    def _get_cookies(self):
+        def on_response(res, **__):
+            if res.headers.get("x-waf-redirect") == "1":
+                if not res.headers.get("X-WAF-Backend-Status"):
+                    log.debug("Getting WAF cookie")
+                    cookie = res.cookies.get(self.HASH_COOKIE)
+                    key = md5(cookie.encode("utf-8")).hexdigest()
+                    res.headers["Location"] = update_qsd(res.headers["Location"], qsd={"key": key})
+                    return res
+                elif res.headers.get("X-WAF-Backend-Status") == "challenge_success":
+                    self.session.http.cookies.update(res.cookies)
+                    return res
 
-    _url_re = re.compile(r'''https?://(?:\w+\.)?vk\.com/video
-        (?:\?z=video)?(?P<video_id>-?[0-9]*_[0-9]*)
-        ''', re.VERBOSE)
-    _url_catalog_re = re.compile(r"https?://(\w+\.)?vk\.com/videos-?[0-9]*")
-    _vod_quality_re = re.compile(r"\.([0-9]*?)\.mp4")
+        url = urlunparse(urlparse(self.url)._replace(path="", query="", fragment=""))
+        self.session.http.get(url, hooks={"response": on_response})
 
-    @classmethod
-    def can_handle_url(cls, url):
-        if cls._url_catalog_re.match(url) is not None:
-            url = cls.follow_vk_redirect(url)
-            if url is None:
-                return False
-        return cls._url_re.match(url) is not None
-
-    @classmethod
-    def follow_vk_redirect(cls, url):
-        # If this is a 'videos' catalog URL
-        # with an video ID in the GET request, get that instead
-        parsed_url = urlparse(url)
-        if parsed_url.path.startswith('/videos'):
-            query = dict((v[0], v[1]) for v in [q.split('=') for q in parsed_url.query.split('&')] if v[0] == 'z')
-            try:
-                true_path = unquote(query['z']).split('/')[0]
-                return parsed_url.scheme + '://' + parsed_url.netloc + '/' + true_path
-            except KeyError:
-                # No redirect found in query string,
-                # so return the catalog url and fail later
-                return url
-        else:
-            return url
-
-    def _get_streams(self):
-        """
-        Find the streams for vk.com
-        :return:
-        """
-        self.session.http.headers.update({'User-Agent': useragents.IPHONE_6})
-
-        # If this is a 'videos' catalog URL
-        # with an video ID in the GET request, get that instead
-        url = self.follow_vk_redirect(self.url)
-
-        m = self._url_re.match(url)
-        if not m:
-            log.error('URL is not compatible: {0}'.format(url))
+    def follow_vk_redirect(self):
+        if self.matches["video"]:
             return
 
-        video_id = m.group('video_id')
-        log.debug('video ID: {0}'.format(video_id))
+        try:
+            parsed_url = urlparse(self.url)
+            true_path = next(unquote(v).split("/")[0] for k, v in parse_qsl(parsed_url.query) if k == "z" and len(v) > 0)
+            self.url = f"{parsed_url.scheme}://{parsed_url.netloc}/{true_path}"
+            if self.matches["video"]:
+                return
+        except StopIteration:
+            pass
 
-        params = {
-            'act': 'show_inline',
-            'al': '1',
-            'video': video_id,
-        }
-        res = self.session.http.post(self.API_URL, params=params)
+        try:
+            self.url = self.session.http.get(
+                self.url,
+                schema=validate.Schema(
+                    validate.parse_html(),
+                    validate.xml_xpath_string(".//head/meta[@property='og:url'][@content]/@content"),
+                    str,
+                ),
+            )
+        except PluginError:
+            pass
+        if self.matches["video"]:
+            return
 
-        for _i in itertags(res.text, 'iframe'):
-            if _i.attributes.get('src'):
-                iframe_url = update_scheme(self.url, _i.attributes['src'])
-                log.debug('Found iframe: {0}'.format(iframe_url))
-                for s in self.session.streams(iframe_url).items():
-                    yield s
+        raise NoStreamsError
 
-        for _i in itertags(res.text, 'source'):
-            if _i.attributes.get('type') == 'application/vnd.apple.mpegurl':
-                video_url = _i.attributes['src']
-                # Remove invalid URL
-                if video_url.startswith('https://vk.com/'):
-                    continue
-                streams = HLSStream.parse_variant_playlist(self.session,
-                                                           video_url)
-                if not streams:
-                    yield 'live', HLSStream(self.session, video_url)
-                else:
-                    for s in streams.items():
-                        yield s
-            elif _i.attributes.get('type') == 'video/mp4':
-                q = 'vod'
-                video_url = _i.attributes['src']
-                m = self._vod_quality_re.search(video_url)
-                if m:
-                    q = '{0}p'.format(m.group(1))
-                yield q, HTTPStream(self.session, video_url)
+    def _get_streams(self):
+        self._get_cookies()
+        self.follow_vk_redirect()
+
+        self.id = self.match["id"]
+        if not self.id:
+            return
+
+        qsd = dict(parse_qsl(urlparse(self.url).query or ""))
+        playlist = qsd.get("list", "")
+
+        log.debug(f"{self.id=}, {playlist=}")
+
+        data = self.session.http.post(
+            self.API_URL,
+            params={"act": "show"},
+            data={
+                "act": "show",
+                "al": "1",
+                "list": playlist,
+                "video": self.id,
+            },
+            headers={
+                "Referer": self.url,
+                "X-Requested-With": "XMLHttpRequest",
+            },
+            schema=validate.Schema(
+                validate.parse_json(),
+                {"payload": list},
+                validate.get(("payload", -1)),
+                list,
+                validate.get(-1),
+                validate.any(
+                    str,
+                    validate.all(
+                        {"player": {"params": list}},
+                        validate.get(("player", "params", 0)),
+                        {
+                            validate.optional("hls"): validate.any(None, validate.url()),
+                            validate.optional("hls_live"): validate.any(None, validate.url()),
+                            validate.optional("hls_ondemand"): validate.any(None, validate.url()),
+                            validate.optional("dash_live"): validate.any(None, validate.url()),
+                            validate.optional("dash_ondemand"): validate.any(None, validate.url()),
+                            validate.optional("md_author"): validate.any(None, str),
+                            validate.optional("md_title"): validate.any(None, str),
+                        },
+                    ),
+                ),
+            ),
+        )
+        if type(data) is not dict:
+            log.error("Video is inaccessible")
+            return
+
+        self.author = data.get("md_author")
+        self.title = data.get("md_title")
+
+        if hls := data.get("hls_live") or data.get("hls_ondemand") or data.get("hls"):
+            return HLSStream.parse_variant_playlist(self.session, hls)
+
+        if dash := data.get("dash_live") or data.get("dash_ondemand"):
+            return DASHStream.parse_manifest(self.session, dash)
 
 
 __plugin__ = VK

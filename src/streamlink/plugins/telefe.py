@@ -1,49 +1,64 @@
+"""
+$description Video content from Telefe, an Argentine TV station.
+$url mitelefe.com
+$type live
+$metadata title
+$region Argentina
+"""
+
+import logging
 import re
+from urllib.parse import urljoin
 
-from streamlink.plugin import Plugin
-from streamlink.plugin.api import useragents, validate
-from streamlink.stream import HLSStream, HTTPStream
-from streamlink.utils import parse_json
+from streamlink.plugin import Plugin, pluginmatcher
+from streamlink.plugin.api import validate
+from streamlink.stream.hls import HLSStream
 
 
+log = logging.getLogger(__name__)
+
+
+@pluginmatcher(re.compile(r"https://mitelefe\.com/vivo"))
 class Telefe(Plugin):
-    _url_re = re.compile(r'https?://telefe.com/.+')
-
-    @classmethod
-    def can_handle_url(cls, url):
-        return cls._url_re.match(url)
-
     def _get_streams(self):
-        res = self.session.http.get(self.url, headers={'User-Agent': useragents.CHROME})
-        video_search = res.text
-        video_search = video_search[video_search.index('{"top":{"view":"PlayerContainer","model":{'):]
-        video_search = video_search[: video_search.index('}]}}') + 4] + "}"
-
-        video_url_found_hls = ""
-        video_url_found_http = ""
-
-        json_video_search = parse_json(video_search)
-        json_video_search_sources = json_video_search["top"]["model"]["videos"][0]["sources"]
-        self.logger.debug('Video ID found: {0}', json_video_search["top"]["model"]["id"])
-        for current_video_source in json_video_search_sources:
-            if "HLS" in current_video_source["type"]:
-                video_url_found_hls = "http://telefe.com" + current_video_source["url"]
-                self.logger.debug("HLS content available")
-            if "HTTP" in current_video_source["type"]:
-                video_url_found_http = "http://telefe.com" + current_video_source["url"]
-                self.logger.debug("HTTP content available")
-
-        self.session.http.headers = {'Referer': self.url,
-                        'User-Agent': useragents.CHROME,
-                        'X-Requested-With': 'ShockwaveFlash/25.0.0.148'}
-
-        if video_url_found_hls:
-            hls_streams = HLSStream.parse_variant_playlist(self.session, video_url_found_hls)
-            for s in hls_streams.items():
-                yield s
-
-        if video_url_found_http:
-            yield "http", HTTPStream(self.session, video_url_found_http)
+        self.title, hls_url = self.session.http.get(
+            self.url,
+            schema=validate.Schema(
+                validate.parse_html(),
+                validate.xml_xpath_string(".//script[contains(text(), 'HLS')]/text()"),
+                validate.none_or_all(
+                    re.compile(r"=\s*(\{.+?});", re.DOTALL | re.MULTILINE),
+                    validate.none_or_all(
+                        validate.get(1),
+                        validate.parse_json(),
+                        {
+                            str: {
+                                "children": {
+                                    "top": {
+                                        "model": {
+                                            "videos": [
+                                                {
+                                                    "title": str,
+                                                    "sources": validate.all(
+                                                        [{"url": str, "type": str}],
+                                                        validate.filter(lambda p: p["type"].lower() == "hls"),
+                                                        validate.get((0, "url")),
+                                                    ),
+                                                },
+                                            ],
+                                        },
+                                    },
+                                },
+                            },
+                        },
+                        validate.transform(lambda k: next(iter(k.values()))),
+                        validate.get(("children", "top", "model", "videos", 0)),
+                        validate.union_get("title", "sources"),
+                    ),
+                ),
+            ),
+        )
+        return HLSStream.parse_variant_playlist(self.session, urljoin(self.url, hls_url))
 
 
 __plugin__ = Telefe

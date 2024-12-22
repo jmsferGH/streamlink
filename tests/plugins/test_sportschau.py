@@ -1,20 +1,12 @@
-import unittest
+from streamlink.plugins.sportschau import Sportschau
+from tests.plugins import PluginCanHandleUrl
 
-from streamlink.plugins.sportschau import sportschau
 
+class TestPluginCanHandleUrlSportschau(PluginCanHandleUrl):
+    __plugin__ = Sportschau
 
-class TestPluginSportschau(unittest.TestCase):
-    def test_can_handle_url(self):
-        should_match = [
-            'http://www.sportschau.de/wintersport/videostream-livestream---wintersport-im-ersten-242.html',
-            'http://www.sportschau.de/weitere/allgemein/video-kite-surf-world-tour-100.html',
-        ]
-        for url in should_match:
-            self.assertTrue(sportschau.can_handle_url(url))
-
-    def test_can_handle_url_negative(self):
-        should_not_match = [
-            'https://example.com/index.html',
-        ]
-        for url in should_not_match:
-            self.assertFalse(sportschau.can_handle_url(url))
+    should_match = [
+        "https://www.sportschau.de/fussball/uefa-euro-2024/spaniens-europameister-begeistert-empfangen,em-spanien-feier-100.html",
+        "https://www.sportschau.de/olympia/live/schwimmen-finals-m-f,livestream-olympia-schwimmen-110.html",
+        "https://www.sportschau.de/podcasts/sportschau-olympia-podcast/tag-6-vier-gewinnt,audio-tag-6-vier-gewinnt-100.html",
+    ]

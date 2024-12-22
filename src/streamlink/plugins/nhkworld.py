@@ -1,30 +1,28 @@
-"""Plugin for NHK World, NHK Japan's english TV channel."""
+"""
+$description Current affairs and cultural channel owned by NHK, a Japanese public, state-owned broadcaster.
+$url nhk.or.jp/nhkworld
+$type live
+"""
 
 import re
 
-from streamlink.plugin import Plugin
-from streamlink.plugin.api import validate
-from streamlink.stream import HLSStream
+from streamlink.plugin import Plugin, pluginmatcher
+from streamlink.stream.hls import HLSStream
 
-API_URL = "http://{}.nhk.or.jp/nhkworld/app/tv/hlslive_web.xml"
 
-_url_re = re.compile(r"http(?:s)?://(?:(\w+)\.)?nhk.or.jp/nhkworld")
-_schema = validate.Schema(
-    validate.xml_findtext("./main_url/wstrm")
+API_URL = "http://{}.nhk.or.jp/nhkworld/app/tv/hlslive_web.json"
+
+
+@pluginmatcher(
+    re.compile(r"https?://(?:(\w+)\.)?nhk\.or\.jp/nhkworld"),
 )
-
-
 class NHKWorld(Plugin):
-    @classmethod
-    def can_handle_url(cls, url):
-        return _url_re.match(url) is not None
-
     def _get_streams(self):
-        # get the HLS xml from the same sub domain as the main url, defaulting to www
-        sdomain = _url_re.match(self.url).group(1) or "www"
+        # get the HLS json from the same sub domain as the main url, defaulting to www
+        sdomain = self.match.group(1) or "www"
         res = self.session.http.get(API_URL.format(sdomain))
 
-        stream_url = self.session.http.xml(res, schema=_schema)
+        stream_url = self.session.http.json(res)["main"]["wstrm"]
         return HLSStream.parse_variant_playlist(self.session, stream_url)
 
 

@@ -1,63 +1,116 @@
+"""
+$description French television news network, covering world news from the European perspective.
+$url euronews.com
+$type live
+"""
+
+import logging
 import re
 
-from streamlink.plugin import Plugin
+from streamlink.plugin import Plugin, PluginError, pluginmatcher
 from streamlink.plugin.api import validate
-from streamlink.stream import HLSStream, HTTPStream
-from streamlink.utils.url import update_scheme
+from streamlink.stream.hls import HLSStream
+from streamlink.stream.http import HTTPStream
 
 
+log = logging.getLogger(__name__)
+
+
+@pluginmatcher(
+    re.compile(r"https?://(?:(?P<subdomain>\w+)\.)?euronews\.com/(?P<live>live$)?"),
+)
 class Euronews(Plugin):
-    _url_re = re.compile(r'(?P<scheme>https?)://(?P<subdomain>\w+)\.?euronews.com/(?P<path>live|.*)')
-    _re_vod = re.compile(r'<meta\s+property="og:video"\s+content="(http.*?)"\s*/>')
-    _live_api_url = "http://{0}.euronews.com/api/watchlive.json"
-    _live_schema = validate.Schema({
-        u"url": validate.url()
-    })
-    _stream_api_schema = validate.Schema({
-        u'status': u'ok',
-        u'primary': validate.url(),
-        validate.optional(u'backup'): validate.url()
-    })
+    API_URL = "https://{subdomain}.euronews.com/api/live/data"
 
-    @classmethod
-    def can_handle_url(cls, url):
-        return cls._url_re.match(url)
+    def _get_live(self):
+        if not self.match["live"] or not self.match["subdomain"]:
+            return
 
-    def _get_vod_stream(self):
-        """
-        Find the VOD video url
-        :return: video url
-        """
-        res = self.session.http.get(self.url)
-        video_urls = self._re_vod.findall(res.text)
-        if len(video_urls):
-            return dict(vod=HTTPStream(self.session, video_urls[0]))
+        try:
+            log.debug("Querying live API")
+            stream_url = self.session.http.get(
+                self.API_URL.format(subdomain=self.match["subdomain"]),
+                params={"locale": self.match["subdomain"]},
+                schema=validate.Schema(
+                    validate.parse_json(),
+                    {"videoPrimaryUrl": validate.url(path=validate.endswith(".m3u8"))},
+                    validate.get("videoPrimaryUrl"),
+                ),
+            )
+        except PluginError:
+            pass
+        else:
+            return HLSStream.parse_variant_playlist(self.session, stream_url)
 
-    def _get_live_streams(self, match):
-        """
-        Get the live stream in a particular language
-        :param match:
-        :return:
-        """
-        live_url = self._live_api_url.format(match.get("subdomain"))
-        live_res = self.session.http.json(self.session.http.get(live_url), schema=self._live_schema)
+    def _get_embed(self, root):
+        schema_video_id = validate.Schema(
+            validate.xml_xpath_string(".//div[@data-video][1]/@data-video"),
+            str,
+            validate.parse_json(),
+            {
+                "player": "pfp",
+                "videoId": str,
+            },
+            validate.get("videoId"),
+        )
+        try:
+            log.debug("Looking for YouTube video ID")
+            video_id = schema_video_id.validate(root)
+        except PluginError:
+            pass
+        else:
+            return self.session.streams(f"https://www.youtube.com/watch?v={video_id}")
 
-        api_url = update_scheme("{0}:///".format(match.get("scheme")), live_res["url"])
-        api_res = self.session.http.json(self.session.http.get(api_url), schema=self._stream_api_schema)
+        schema_video_url = validate.Schema(
+            validate.xml_xpath_string(".//iframe[@id='pfpPlayer'][starts-with(@src,'https://www.youtube.com/')][1]/@src"),
+            str,
+        )
+        try:
+            log.debug("Looking for embedded YouTube iframe")
+            video_url = schema_video_url.validate(root)
+        except PluginError:
+            pass
+        else:
+            return self.session.streams(video_url)
 
-        return HLSStream.parse_variant_playlist(self.session, api_res["primary"])
+    def _get_vod(self, root):
+        schema_vod = validate.Schema(
+            validate.any(
+                validate.all(
+                    validate.xml_xpath_string(".//meta[@property='og:video'][1]/@content"),
+                    str,
+                ),
+                validate.all(
+                    validate.xml_xpath_string(".//div[@data-video][1]/@data-video"),
+                    str,
+                    validate.parse_json(),
+                    {"url": str},
+                    validate.get("url"),
+                ),
+            ),
+            validate.url(),
+        )
+        try:
+            log.debug("Looking for VOD URL")
+            video_url = schema_vod.validate(root)
+        except PluginError:
+            pass
+        else:
+            return dict(vod=HTTPStream(self.session, video_url))
 
     def _get_streams(self):
-        """
-        Find the streams for euronews
-        :return:
-        """
-        match = self._url_re.match(self.url).groupdict()
+        live = self._get_live()
+        if live:
+            return live
 
-        if match.get("path") == "live":
-            return self._get_live_streams(match)
-        else:
-            return self._get_vod_stream()
+        root = self.session.http.get(
+            self.url,
+            schema=validate.Schema(
+                validate.parse_html(),
+            ),
+        )
+
+        return self._get_embed(root) or self._get_vod(root)
 
 
 __plugin__ = Euronews

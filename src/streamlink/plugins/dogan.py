@@ -1,93 +1,166 @@
-# coding=utf-8
-from __future__ import print_function
+"""
+$description Turkish live TV channels and video on-demand service from Dogan Group, including CNN Turk and Kanal D.
+$url cnnturk.com
+$url dreamturk.com.tr
+$url dreamtv.com.tr
+$url kanald.com.tr
+$url teve2.com.tr
+$type live, vod
+"""
 
+import logging
 import re
+from urllib.parse import urljoin
 
-from streamlink.compat import urljoin
-from streamlink.plugin import Plugin
+from streamlink.plugin import Plugin, PluginError, pluginmatcher
 from streamlink.plugin.api import validate
-from streamlink.stream import HLSStream
+from streamlink.stream.hls import HLSStream
 
 
+log = logging.getLogger(__name__)
+
+
+@pluginmatcher(re.compile(r"https?://(?:www\.)?cnnturk\.com/"))
+@pluginmatcher(re.compile(r"https?://(?:www\.)?(dreamturk|dreamtv)\.com\.tr/"))
+@pluginmatcher(re.compile(r"https?://(?:www\.)?teve2\.com\.tr/"))
+@pluginmatcher(re.compile(r"https?://(?:www\.)?kanald\.com\.tr/"))
 class Dogan(Plugin):
-    """
-    Support for the live streams from Doğan Media Group channels
-    """
-    url_re = re.compile(r"""
-        https?://(?:www.)?
-        (?:teve2.com.tr/(?:canli-yayin|filmler/.*|programlar/.*)|
-           kanald.com.tr/.*|
-           cnnturk.com/canli-yayin|
-           dreamtv.com.tr/canli-yayin|
-           dreamturk.com.tr/canli)
-    """, re.VERBOSE)
-    playerctrl_re = re.compile(r'''<div[^>]*?ng-controller=(?P<quote>["'])(?:Live)?PlayerCtrl(?P=quote).*?>''', re.DOTALL)
-    data_id_re = re.compile(r'''data-id=(?P<quote>["'])(?P<id>\w+)(?P=quote)''')
-    content_id_re = re.compile(r'"content(?:I|i)d", "(\w+)"')
-    item_id_re = re.compile(r"_itemId\s+=\s+'(\w+)';")
-    content_api = "/actions/content/media/{id}"
-    new_content_api = "/action/media/{id}"
-    content_api_schema = validate.Schema({
-        "Id": validate.text,
-        "Media": {
-            "Link": {
-                "DefaultServiceUrl": validate.url(),
-                validate.optional("ServiceUrl"): validate.any(validate.url(), ""),
-                "SecurePath": validate.text,
-            }
-        }
-    })
+    # based on the order of matchers
+    API_URLS = [
+        "/api/media?id={id}",
+        "/actions/content/media/{id}",
+        "/action/media/{id}",
+    ]
+    API_URL_OLD = "/actions/media?id={id}"
 
-    @classmethod
-    def can_handle_url(cls, url):
-        return cls.url_re.match(url) is not None
+    @staticmethod
+    def _get_hls_url(root):
+        schema = validate.Schema(
+            validate.xml_xpath_string(".//*[@data-live][contains(@data-url,'.m3u8')]/@data-url"),
+        )
 
-    def _get_content_id(self):
-        res = self.session.http.get(self.url)
-        # find the contentId
-        content_id_m = self.content_id_re.search(res.text)
-        if content_id_m:
-            self.logger.debug("Found contentId by contentId regex")
-            return content_id_m.group(1)
+        return schema.validate(root)
 
-        # find the PlayerCtrl div
-        player_ctrl_m = self.playerctrl_re.search(res.text)
-        if player_ctrl_m:
-            # extract the content id from the player control data
-            player_ctrl_div = player_ctrl_m.group(0)
-            content_id_m = self.data_id_re.search(player_ctrl_div)
-            if content_id_m:
-                self.logger.debug("Found contentId by player data-id regex")
-                return content_id_m.group("id")
+    @staticmethod
+    def _get_content_id(root):
+        schema = validate.Schema(
+            validate.any(
+                validate.all(
+                    validate.xml_xpath_string("""
+                        .//div[@data-id][
+                            @data-live
+                            or @id='video-element'
+                            or @id='player-container'
+                            or contains(@class, 'player-container')
+                        ][1]/@data-id
+                    """),
+                    str,
+                ),
+                # xpath query needs to have a lower priority
+                validate.all(
+                    validate.xml_xpath_string(
+                        ".//body[@data-content-id][1]/@data-content-id",
+                    ),
+                    str,
+                ),
+            ),
+        )
 
-        # find the itemId var
-        item_id_m = self.item_id_re.search(res.text)
-        if item_id_m:
-            self.logger.debug("Found contentId by itemId regex")
-            return item_id_m.group(1)
+        return schema.validate(root)
 
-    def _get_hls_url(self, content_id):
-        # make the api url relative to the current domain
-        if "cnnturk" in self.url or "teve2.com.tr" in self.url:
-            self.logger.debug("Using new content API url")
-            api_url = urljoin(self.url, self.new_content_api.format(id=content_id))
-        else:
-            api_url = urljoin(self.url, self.content_api.format(id=content_id))
+    def _api_query_new(self, content_id, api_url):
+        url = urljoin(self.url, api_url.format(id=content_id))
+        data = self.session.http.get(
+            url,
+            schema=validate.Schema(
+                validate.parse_json(),
+                validate.any(
+                    validate.all(
+                        str,
+                        validate.parse_json(),
+                        {"Error": str},
+                        validate.get("Error"),
+                    ),
+                    validate.all(
+                        {
+                            "Media": {
+                                "Link": {
+                                    "ContentId": str,
+                                    validate.optional("DefaultServiceUrl"): validate.any(validate.url(), ""),
+                                    validate.optional("ServiceUrl"): validate.any(validate.url(), ""),
+                                    "SecurePath": str,
+                                },
+                            },
+                        },
+                        validate.get(("Media", "Link")),
+                        validate.union_get("ServiceUrl", "DefaultServiceUrl", "SecurePath", "ContentId"),
+                    ),
+                ),
+            ),
+        )
+        if isinstance(data, str):
+            log.error(data)
+            return
 
-        apires = self.session.http.get(api_url)
+        service_url, default_service_url, secure_path, content_id = data
 
-        stream_data = self.session.http.json(apires, schema=self.content_api_schema)
-        d = stream_data["Media"]["Link"]
-        return urljoin((d["ServiceUrl"] or d["DefaultServiceUrl"]), d["SecurePath"])
+        if default_service_url == "https://www.kanald.com.tr":
+            self.url = default_service_url
+            return self._api_query_old(content_id)
+
+        if re.match(r"^https?://", secure_path):
+            return secure_path
+
+        return urljoin(service_url or default_service_url, secure_path)
+
+    def _api_query_old(self, content_id):
+        url = urljoin(self.url, self.API_URL_OLD.format(id=content_id))
+        service_url, default_service_url, secure_path = self.session.http.get(
+            url,
+            schema=validate.Schema(
+                validate.parse_json(),
+                {
+                    "data": {
+                        "id": str,
+                        "media": {
+                            "link": {
+                                validate.optional("defaultServiceUrl"): validate.any(validate.url(), ""),
+                                validate.optional("serviceUrl"): validate.any(validate.url(), ""),
+                                "securePath": str,
+                            },
+                        },
+                    },
+                },
+                validate.get(("data", "media", "link")),
+                validate.union_get("serviceUrl", "defaultServiceUrl", "securePath"),
+            ),
+        )
+
+        return urljoin(service_url or default_service_url, secure_path)
+
+    def _query_hls_url(self, content_id):
+        for idx, match in enumerate(self.matches[: len(self.API_URLS)]):
+            if match:
+                return self._api_query_new(content_id, self.API_URLS[idx])
+
+        return self._api_query_old(content_id)
 
     def _get_streams(self):
-        content_id = self._get_content_id()
-        if content_id:
-            self.logger.debug(u"Loading content: {}", content_id)
-            hls_url = self._get_hls_url(content_id)
+        root = self.session.http.get(self.url, schema=validate.Schema(validate.parse_html()))
+
+        hls_url = self._get_hls_url(root)
+        if not hls_url:
+            try:
+                content_id = self._get_content_id(root)
+            except PluginError:
+                log.error("Could not find the content ID for this stream")
+                return
+
+            log.debug(f"Loading content: {content_id}")
+            hls_url = self._query_hls_url(content_id)
+
+        if hls_url:
             return HLSStream.parse_variant_playlist(self.session, hls_url)
-        else:
-            self.logger.error(u"Could not find the contentId for this stream")
 
 
 __plugin__ = Dogan

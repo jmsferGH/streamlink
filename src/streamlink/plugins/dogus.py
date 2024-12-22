@@ -1,63 +1,52 @@
+"""
+$description Turkish live TV channels from Dogus Group, including Euro Star, Star and NTV.
+$url eurostartv.com.tr
+$url kralmuzik.com.tr
+$url ntv.com.tr
+$url startv.com.tr
+$type live
+"""
+
 import re
-import logging
 
-from streamlink.plugin import Plugin
-from streamlink.plugin.api.utils import itertags
-from streamlink.plugins.youtube import YouTube
-from streamlink.stream import HLSStream
-from streamlink.utils import update_scheme
-
-log = logging.getLogger(__name__)
+from streamlink.plugin import Plugin, pluginmatcher
+from streamlink.plugin.api import validate
+from streamlink.stream.hls import HLSStream
 
 
+@pluginmatcher(re.compile(r"https?://(?:www\.)?eurostartv\.com\.tr/canli-izle"))
+@pluginmatcher(re.compile(r"https?://(?:www\.)?kralmuzik\.com\.tr/tv/.+"))
+@pluginmatcher(re.compile(r"https?://(?:www\.)?ntv\.com\.tr/canli-yayin/ntv"))
+@pluginmatcher(re.compile(r"https?://(?:www\.)?startv\.com\.tr/canli-yayin"))
 class Dogus(Plugin):
-    """
-    Support for live streams from Dogus sites include ntv, ntvspor, and kralmuzik
-    """
-
-    url_re = re.compile(r"""https?://(?:www.)?
-        (?:
-            ntv.com.tr/canli-yayin/ntv|
-            ntvspor.net/canli-yayin|
-            kralmuzik.com.tr/tv/|
-            eurostartv.com.tr/canli-izle
-        )/?""", re.VERBOSE)
-    mobile_url_re = re.compile(r"""(?P<q>["'])(?P<url>(https?:)?//[^'"]*?/live/hls/[^'"]*?\?token=)
-                                   (?P<token>[^'"]*?)(?P=q)""", re.VERBOSE)
-    token_re = re.compile(r"""token=(?P<q>["'])(?P<token>[^'"]*?)(?P=q)""")
-    kral_token_url = "https://service.kralmuzik.com.tr/version/gettoken"
-
-    @classmethod
-    def can_handle_url(cls, url):
-        return cls.url_re.match(url) is not None
+    _re_live_hls = re.compile(r"'(https?://[^']+/live/hls/[^']+)'")
+    _re_yt_script = re.compile(r"youtube\.init\('([\w-]{11})'")
 
     def _get_streams(self):
-        res = self.session.http.get(self.url)
+        root = self.session.http.get(self.url, schema=validate.Schema(validate.parse_html()))
 
-        # Look for Youtube embedded video first
-        for iframe in itertags(res.text, 'iframe'):
-            if YouTube.can_handle_url(iframe.attributes.get("src")):
-                log.debug("Handing off to YouTube plugin")
-                return self.session.streams(iframe.attributes.get("src"))
+        # https://www.ntv.com.tr/canli-yayin/ntv?youtube=true
+        yt_iframe = root.xpath("string(.//iframe[contains(@src,'youtube.com')][1]/@src)")
+        # https://www.startv.com.tr/canli-yayin
+        dm_iframe = root.xpath("string(.//iframe[contains(@src,'dailymotion.com')][1]/@src)")
+        # https://www.kralmuzik.com.tr/tv/kral-tv
+        # https://www.kralmuzik.com.tr/tv/kral-pop-tv
+        yt_script = root.xpath("string(.//script[contains(text(), 'youtube.init')][1]/text())")
+        if yt_script:
+            m = self._re_yt_script.search(yt_script)
+            if m:
+                yt_iframe = f"https://www.youtube.com/watch?v={m.group(1)}"
 
-        # Next check for HLS URL with token
-        mobile_url_m = self.mobile_url_re.search(res.text)
-        mobile_url = mobile_url_m and update_scheme(self.url, mobile_url_m.group("url"))
-        if mobile_url:
-            log.debug("Found mobile stream: {0}".format(mobile_url_m.group(0)))
+        iframe = yt_iframe or dm_iframe
+        if iframe:
+            return self.session.streams(iframe)
 
-            token = mobile_url_m and mobile_url_m.group("token")
-            if not token and "kralmuzik" in self.url:
-                log.debug("Getting Kral Muzik HLS stream token from API")
-                token = self.session.http.get(self.kral_token_url).text
-            elif not token:
-                # if no token is in the url, try to find it else where in the page
-                log.debug("Searching for HLS stream token in URL")
-                token_m = self.token_re.search(res.text)
-                token = token_m and token_m.group("token")
-
-            return HLSStream.parse_variant_playlist(self.session, mobile_url + token,
-                                                    headers={"Referer": self.url})
+        # http://eurostartv.com.tr/canli-izle
+        dd_script = root.xpath("string(.//script[contains(text(), '/live/hls/')][1]/text())")
+        if dd_script:
+            m = self._re_live_hls.search(dd_script)
+            if m:
+                return HLSStream.parse_variant_playlist(self.session, m.group(1))
 
 
 __plugin__ = Dogus

@@ -1,22 +1,15 @@
-import unittest
-
 from streamlink.plugins.okru import OKru
+from tests.plugins import PluginCanHandleUrl
 
 
-class TestPluginOKru(unittest.TestCase):
-    def test_can_handle_url(self):
-        should_match = [
-            'https://ok.ru/live/12345',
-            'http://ok.ru/live/12345',
-            'http://www.ok.ru/live/12345',
-            'https://ok.ru/video/266205792931',
-        ]
-        for url in should_match:
-            self.assertTrue(OKru.can_handle_url(url), url)
+class TestPluginCanHandleUrlOKru(PluginCanHandleUrl):
+    __plugin__ = OKru
 
-    def test_can_handle_url_negative(self):
-        should_not_match = [
-            'https://www.example.com',
-        ]
-        for url in should_not_match:
-            self.assertFalse(OKru.can_handle_url(url), url)
+    should_match = [
+        ("default", "https://ok.ru/live/ID"),
+        ("default", "https://ok.ru/video/ID"),
+        ("default", "https://ok.ru/videoembed/ID"),
+        ("default", "https://www.ok.ru/video/ID"),
+        ("mobile", "https://m.ok.ru/video/ID"),
+        ("mobile", "https://mobile.ok.ru/video/ID"),
+    ]

@@ -1,54 +1,93 @@
+"""
+$description Live TV channels from LTV, a Latvian public, state-owned broadcaster.
+$url ltv.lsm.lv
+$url replay.lsm.lv
+$type live, vod
+$region Latvia
+"""
+
 import logging
 import re
 
-from streamlink.compat import urlparse
-from streamlink.plugin import Plugin
-from streamlink.plugin.api import useragents
-from streamlink.plugin.api.utils import itertags
-from streamlink.stream import HLSStream
+from streamlink.plugin import Plugin, pluginmatcher
+from streamlink.plugin.api import validate
+from streamlink.stream.hls import HLSStream
+
 
 log = logging.getLogger(__name__)
 
 
+@pluginmatcher(
+    re.compile(r"https://(?:ltv|replay)\.lsm\.lv/(?:lv/tiesraide|ru/efir)/"),
+)
 class LtvLsmLv(Plugin):
-    """
-    Support for Latvian live channels streams on ltv.lsm.lv
-    """
-    url_re = re.compile(r"https?://ltv\.lsm\.lv/lv/tieshraide")
-
-    @classmethod
-    def can_handle_url(cls, url):
-        return cls.url_re.match(url) is not None
+    URL_API = "https://player.cloudycdn.services/player/ltvlive/channel/{channel_id}/"
 
     def _get_streams(self):
-        self.session.http.headers.update({
-           "Referer": self.url,
-           "User-Agent": useragents.FIREFOX
-        })
+        self.session.http.headers.update({"Referer": self.url})
 
-        iframe_url = None
-        res = self.session.http.get(self.url)
-        for iframe in itertags(res.text, "iframe"):
-            if "embed.lsm.lv" in iframe.attributes.get("src"):
-                iframe_url = iframe.attributes.get("src")
-                break
-
+        iframe_url = self.session.http.get(
+            self.url,
+            schema=validate.Schema(
+                re.compile(r"""(?P<q>")https:\\u002F\\u002Fltv\.lsm\.lv\\u002Fembed\\u002Flive\?\S+?(?P=q)"""),
+                validate.none_or_all(
+                    validate.get(0),
+                    validate.parse_json(),
+                ),
+            ),
+        )
         if not iframe_url:
-            log.error("Could not find player iframe")
+            log.error("Could not find video player iframe")
             return
 
-        log.debug("Found iframe: {0}".format(iframe_url))
-        res = self.session.http.get(iframe_url)
-        for source in itertags(res.text, "source"):
-            if source.attributes.get("src"):
-                stream_url = source.attributes.get("src")
-                url_path = urlparse(stream_url).path
-                if url_path.endswith(".m3u8"):
-                    for s in HLSStream.parse_variant_playlist(self.session,
-                                                              stream_url).items():
-                        yield s
-                else:
-                    log.debug("Not used URL path: {0}".format(url_path))
+        starts_at, channel_id = self.session.http.get(
+            iframe_url,
+            schema=validate.Schema(
+                validate.parse_html(),
+                validate.xml_xpath_string(".//live[1]/@*[name()=':embed-data']"),
+                str,
+                validate.parse_json(),
+                {
+                    "parentInfo": {"starts_at": validate.any(None, str)},
+                    "source": {"item_id": str},
+                },
+                validate.union_get(
+                    ("parentInfo", "starts_at"),
+                    ("source", "item_id"),
+                ),
+            ),
+        )
+        if channel_id is None:
+            return
+        log.debug(f"Found channel ID: {channel_id}")
+
+        if starts_at is not None:
+            log.error(f"Stream starts at {starts_at}")
+            return
+
+        stream_sources = self.session.http.post(
+            self.URL_API.format(channel_id=channel_id),
+            data={
+                "refer": "ltv.lsm.lv",
+                "playertype": "regular",
+                "protocol": "hls",
+            },
+            schema=validate.Schema(
+                validate.parse_json(),
+                {
+                    "source": {
+                        "sources": validate.all(
+                            [{"type": str, "src": validate.url()}],
+                            validate.filter(lambda src: src["type"] == "application/x-mpegURL"),
+                            validate.map(lambda src: src.get("src")),
+                        ),
+                    },
+                },
+                validate.get(("source", "sources")),
+            ),
+        )
+        for surl in stream_sources:
+            yield from HLSStream.parse_variant_playlist(self.session, surl).items()
 
 
 __plugin__ = LtvLsmLv

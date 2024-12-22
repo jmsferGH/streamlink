@@ -1,22 +1,24 @@
-import unittest
-
 from streamlink.plugins.goodgame import GoodGame
+from tests.plugins import PluginCanHandleUrl
 
 
-class TestPluginGoodGame(unittest.TestCase):
-    def test_can_handle_url(self):
-        should_match = [
-            'https://goodgame.ru/channel/ABC_ABC/#autoplay',
-            'https://goodgame.ru/channel/ABC123ABC/#autoplay',
-            'https://goodgame.ru/channel/ABC/#autoplay',
-            'https://goodgame.ru/channel/123ABC123/#autoplay',
-        ]
-        for url in should_match:
-            self.assertTrue(GoodGame.can_handle_url(url))
+class TestPluginCanHandleUrlGoodGame(PluginCanHandleUrl):
+    __plugin__ = GoodGame
 
-    def test_can_handle_url_negative(self):
-        should_not_match = [
-            'https://example.com/index.html',
-        ]
-        for url in should_not_match:
-            self.assertFalse(GoodGame.can_handle_url(url))
+    should_match_groups = [
+        (("default", "https://goodgame.ru/CHANNELNAME"), {"name": "CHANNELNAME"}),
+        (("default", "https://goodgame.ru/CHANNELNAME/"), {"name": "CHANNELNAME"}),
+        (("default", "https://goodgame.ru/CHANNELNAME?foo=bar"), {"name": "CHANNELNAME"}),
+        (("default", "https://www.goodgame.ru/CHANNELNAME"), {"name": "CHANNELNAME"}),
+        (("channel", "https://goodgame.ru/channel/CHANNELNAME"), {"channel": "CHANNELNAME"}),
+        (("channel", "https://goodgame.ru/channel/CHANNELNAME/"), {"channel": "CHANNELNAME"}),
+        (("channel", "https://goodgame.ru/channel/CHANNELNAME?foo=bar"), {"channel": "CHANNELNAME"}),
+        (("channel", "https://www.goodgame.ru/channel/CHANNELNAME"), {"channel": "CHANNELNAME"}),
+        (("player", "https://goodgame.ru/player?1234"), {"id": "1234"}),
+        (("player", "https://www.goodgame.ru/player?1234"), {"id": "1234"}),
+    ]
+
+    should_not_match = [
+        "https://goodgame.ru/channel",
+        "https://goodgame.ru/player",
+    ]

@@ -1,23 +1,37 @@
-import unittest
-
 from streamlink.plugins.tv4play import TV4Play
+from tests.plugins import PluginCanHandleUrl
 
 
-class TestPluginTV4Play(unittest.TestCase):
+class TestPluginCanHandleUrlTV4Play(PluginCanHandleUrl):
+    __plugin__ = TV4Play
 
-    def test_can_handle_url(self):
-        should_match = [
-            'https://www.tv4play.se/program/fridas-vm-resa/10000884',
-            'https://www.tv4play.se/program/monk/3938989',
-            'https://www.tv4play.se/program/nyheterna/10378590',
-            'https://www.fotbollskanalen.se/video/10395484/ghoddos-fullbordar-vandningen---ger-ofk-ledningen/',
-        ]
-        for url in should_match:
-            self.assertTrue(TV4Play.can_handle_url(url))
-
-    def test_can_handle_url_negative(self):
-        should_not_match = [
-            'https://example.com/index.html',
-        ]
-        for url in should_not_match:
-            self.assertFalse(TV4Play.can_handle_url(url))
+    should_match_groups = [
+        (
+            (
+                "default",
+                "https://www.tv4play.se/program/robinson/del-26-sasong-2021/13299862",
+            ),
+            {"video_id": "13299862"},
+        ),
+        (
+            (
+                "default",
+                "https://www.tv4play.se/program/sverige-mot-norge/del-1-sasong-1/12490380",
+            ),
+            {"video_id": "12490380"},
+        ),
+        (
+            (
+                "default",
+                "https://www.tv4play.se/program/nyheterna/live/10378590",
+            ),
+            {"video_id": "10378590"},
+        ),
+        (
+            (
+                "fotbollskanalen",
+                "https://www.fotbollskanalen.se/video/10395484/ghoddos-fullbordar-vandningen---ger-ofk-ledningen/",
+            ),
+            {"video_id": "10395484"},
+        ),
+    ]

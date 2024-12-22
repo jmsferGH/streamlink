@@ -1,12 +1,19 @@
-import unittest
-
 from streamlink.plugins.dlive import DLive
+from tests.plugins import PluginCanHandleUrl
 
 
-class TestPluginDLive(unittest.TestCase):
-    def test_can_handle_url(self):
-        # should match
-        self.assertTrue(DLive.can_handle_url("https://dlive.tv/pewdiepie"))
+class TestPluginCanHandleUrlDLive(PluginCanHandleUrl):
+    __plugin__ = DLive
 
-        # shouldn't match
-        self.assertFalse(DLive.can_handle_url("https://twitch.tv/lirik"))
+    should_match_groups = [
+        (("live", "https://dlive.tv/cryptokaprika"), {"channel": "cryptokaprika"}),
+        (("live", "https://dlive.tv/cryptokaprika?query"), {"channel": "cryptokaprika"}),
+        (("live", "https://dlive.tv/cryptokaprika#hash"), {"channel": "cryptokaprika"}),
+        (("vod", "https://dlive.tv/p/countrycafebgky+oLCFcknSR"), {"video": "countrycafebgky+oLCFcknSR"}),
+        (("vod", "https://dlive.tv/p/countrycafebgky+oLCFcknSR?query"), {"video": "countrycafebgky+oLCFcknSR"}),
+        (("vod", "https://dlive.tv/p/countrycafebgky+oLCFcknSR#hash"), {"video": "countrycafebgky+oLCFcknSR"}),
+    ]
+
+    should_not_match = [
+        "https://dlive.tv/",
+    ]

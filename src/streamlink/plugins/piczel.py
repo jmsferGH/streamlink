@@ -1,72 +1,68 @@
+"""
+$description Global live-streaming platform for the creative community.
+$url piczel.tv
+$type live
+$metadata id
+$metadata author
+$metadata title
+"""
+
 import re
 
-from streamlink.plugin import Plugin
+from streamlink.plugin import Plugin, pluginmatcher
 from streamlink.plugin.api import validate
-from streamlink.stream import RTMPStream, HLSStream
+from streamlink.stream.hls import HLSStream
 
-STREAMS_URL = "https://piczel.tv:3000/streams/{0}?&page=1&sfw=false&live_only=true"
-HLS_URL = "https://5810b93fdf674.streamlock.net:1936/live/{0}/playlist.m3u8"
-RTMP_URL = "rtmp://piczel.tv:1935/live/{0}"
 
-_url_re = re.compile(r"https://piczel.tv/watch/(\w+)")
-
-_streams_schema = validate.Schema(
-    {
-        "type": validate.text,
-        "data": [
-            {
-                "id": int,
-                "live": bool,
-                "slug": validate.text
-            }
-        ]
-    }
+@pluginmatcher(
+    re.compile(r"https?://piczel\.tv/watch/(?P<channel>\w+)"),
 )
-
-
 class Piczel(Plugin):
-    @classmethod
-    def can_handle_url(cls, url):
-        return _url_re.match(url)
+    _URL_STREAMS = "https://piczel.tv/api/streams"
+    _URL_HLS = "https://playback.piczel.tv/live/{id}/llhls.m3u8?_HLS_legacy=YES"
 
     def _get_streams(self):
-        match = _url_re.match(self.url)
-        if not match:
+        channel = self.match.group("channel")
+
+        data = self.session.http.get(
+            self._URL_STREAMS,
+            params={
+                "followedStreams": "false",
+                "live_only": "false",
+                "sfw": "false",
+            },
+            schema=validate.Schema(
+                validate.parse_json(),
+                [
+                    {
+                        "slug": str,
+                        "live": bool,
+                        "id": int,
+                        "username": str,
+                        "title": str,
+                    },
+                ],
+                validate.filter(lambda item: item["slug"] == channel),
+                validate.get(0),
+                validate.any(
+                    None,
+                    validate.union_get(
+                        "id",
+                        "username",
+                        "title",
+                        "live",
+                    ),
+                ),
+            ),
+        )
+        if not data:
             return
 
-        channel_name = match.group(1)
-
-        res = self.session.http.get(STREAMS_URL.format(channel_name))
-        streams = self.session.http.json(res, schema=_streams_schema)
-        if streams["type"] not in ("multi", "stream"):
+        self.id, self.author, self.title, is_live = data
+        if not is_live:
             return
 
-        for stream in streams["data"]:
-            if stream["slug"] != channel_name:
-                continue
-
-            if not stream["live"]:
-                return
-
-            streams = {}
-
-            try:
-                streams.update(HLSStream.parse_variant_playlist(self.session, HLS_URL.format(stream["id"])))
-            except IOError as e:
-                # fix for hosted offline streams
-                if "404 Client Error" in str(e):
-                    return
-                raise
-
-            streams["rtmp"] = RTMPStream(self.session, {
-                "rtmp": RTMP_URL.format(stream["id"]),
-                "pageUrl": self.url,
-                "live": True
-            })
-
-            return streams
-
-        return
+        return HLSStream.parse_variant_playlist(self.session, self._URL_HLS.format(id=self.id))
 
 
 __plugin__ = Piczel

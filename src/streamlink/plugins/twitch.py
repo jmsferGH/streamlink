@@ -1,222 +1,268 @@
-# coding=utf-8
+"""
+$description Global live-streaming and video hosting social platform owned by Amazon.
+$url twitch.tv
+$type live, vod
+$webbrowser Required for getting a new :ref:`client-integrity token <cli/plugins/twitch:Client-integrity token>`.
+$metadata id
+$metadata author
+$metadata category
+$metadata title
+$notes See the :ref:`Authentication <cli/plugins/twitch:Authentication>` docs on how to prevent ads.
+$notes Read more about :ref:`embedded ads <cli/plugins/twitch:Embedded ads>` here.
+$notes :ref:`Low latency streaming <cli/plugins/twitch:Low latency streaming>` is supported.
+$notes Acquires a :ref:`client-integrity token <cli/plugins/twitch:Client-integrity token>` on streaming access token failure.
+"""
+
+from __future__ import annotations
+
+import argparse
 import logging
+import math
 import re
-import warnings
-from collections import namedtuple
+import sys
+from collections import deque
+from collections.abc import Mapping
+from contextlib import suppress
+from dataclasses import dataclass, replace as dataclass_replace
+from datetime import datetime, timedelta
+from json import dumps as json_dumps
 from random import random
+from typing import ClassVar
+from urllib.parse import urlparse
 
-import requests
+from requests.exceptions import HTTPError
 
-from streamlink.compat import urlparse
-from streamlink.exceptions import NoStreamsError, PluginError, StreamError
-from streamlink.plugin import Plugin, PluginArguments, PluginArgument
+from streamlink.exceptions import NoStreamsError, PluginError
+from streamlink.plugin import Plugin, pluginargument, pluginmatcher
 from streamlink.plugin.api import validate
-from streamlink.plugin.api.utils import parse_json, parse_query
-from streamlink.stream import (
-    HTTPStream, HLSStream, FLVPlaylist, extract_flv_header_tags
+from streamlink.session import Streamlink
+from streamlink.stream.hls import (
+    M3U8,
+    DateRange,
+    HLSPlaylist,
+    HLSSegment,
+    HLSStream,
+    HLSStreamReader,
+    HLSStreamWorker,
+    HLSStreamWriter,
+    M3U8Parser,
+    parse_tag,
 )
-from streamlink.stream.hls import HLSStreamReader, HLSStreamWriter, HLSStreamWorker
-from streamlink.stream.hls_playlist import M3U8Parser, load as load_hls_playlist
-from streamlink.utils.times import hours_minutes_seconds
-
-try:
-    from itertools import izip as zip
-except ImportError:
-    pass
+from streamlink.stream.http import HTTPStream
+from streamlink.utils.parse import parse_json, parse_qsd
+from streamlink.utils.random import CHOICES_ALPHA_NUM, random_token
+from streamlink.utils.times import fromtimestamp, hours_minutes_seconds_float
+from streamlink.utils.url import update_qsd
 
 
 log = logging.getLogger(__name__)
 
-QUALITY_WEIGHTS = {
-    "source": 1080,
-    "1080": 1080,
-    "high": 720,
-    "720": 720,
-    "medium": 480,
-    "480": 480,
-    "360": 360,
-    "low": 240,
-    "mobile": 120,
-}
+LOW_LATENCY_MAX_LIVE_EDGE = 2
 
-TWITCH_CLIENT_ID = "pwkzresl8kj2rdj6g7bvxl9ys1wly3j"
 
-_url_re = re.compile(r"""
-    http(s)?://
-    (?:
-        (?P<subdomain>[\w\-]+)
-        \.
-    )?
-    twitch.tv/
-    (?:
-        videos/(?P<videos_id>\d+)|
-        (?P<channel>[^/]+)
-    )
-    (?:
-        /
-        (?P<video_type>[bcv])(?:ideo)?
-        /
-        (?P<video_id>\d+)
-    )?
-    (?:
-        /
-        (?P<clip_name>[\w]+)
-    )?
-""", re.VERBOSE)
+@dataclass
+class TwitchHLSSegment(HLSSegment):
+    ad: bool
+    prefetch: bool
 
-_access_token_schema = validate.Schema(
-    {
-        "token": validate.text,
-        "sig": validate.text
-    },
-    validate.union((
-        validate.get("sig"),
-        validate.get("token")
-    ))
-)
-_token_schema = validate.Schema(
-    {
-        "chansub": {
-            "restricted_bitrates": validate.all(
-                [validate.text],
-                validate.filter(
-                    lambda n: not re.match(r"(.+_)?archives|live|chunked", n)
-                )
-            )
-        }
-    },
-    validate.get("chansub")
-)
-_user_schema = validate.Schema(
-    {
-        validate.optional("display_name"): validate.text
-    },
-    validate.get("display_name")
-)
-_video_schema = validate.Schema(
-    {
-        "chunks": {
-            validate.text: [{
-                "length": int,
-                "url": validate.any(None, validate.url(scheme="http")),
-                "upkeep": validate.any("pass", "fail", None)
-            }]
-        },
-        "restrictions": {validate.text: validate.text},
-        "start_offset": int,
-        "end_offset": int,
-    }
-)
-_viewer_info_schema = validate.Schema(
-    {
-        validate.optional("login"): validate.text
-    },
-    validate.get("login")
-)
-_viewer_token_schema = validate.Schema(
-    {
-        validate.optional("token"): validate.text
-    },
-    validate.get("token")
-)
-_quality_options_schema = validate.Schema(
-    {
-        "quality_options": validate.all(
-            [{
-                "quality": validate.any(validate.text, None),
-                "source": validate.url(
-                    scheme="https",
-                    path=validate.endswith(".mp4")
-                )
-            }]
+
+class TwitchM3U8(M3U8[TwitchHLSSegment, HLSPlaylist]):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.dateranges_ads: list[DateRange] = []
+
+
+class TwitchM3U8Parser(M3U8Parser[TwitchM3U8, TwitchHLSSegment, HLSPlaylist]):
+    __m3u8__: ClassVar[type[TwitchM3U8]] = TwitchM3U8
+    __segment__: ClassVar[type[TwitchHLSSegment]] = TwitchHLSSegment
+
+    @parse_tag("EXT-X-TWITCH-LIVE-SEQUENCE")
+    def parse_ext_x_twitch_live_sequence(self, value):
+        # Unset discontinuity state if the previous segment was not an ad,
+        # as the following segment won't be an ad
+        if self.m3u8.segments and not self.m3u8.segments[-1].ad:
+            self._discontinuity = False
+
+    @parse_tag("EXT-X-TWITCH-PREFETCH")
+    def parse_tag_ext_x_twitch_prefetch(self, value):
+        segments = self.m3u8.segments
+        if not segments:  # pragma: no cover
+            return
+        last = segments[-1]
+
+        # Use the average duration of all regular segments for the duration of prefetch segments.
+        # This is better than using the duration of the last segment when regular segment durations vary a lot.
+        # In low latency mode, the playlist reload time is the duration of the last segment.
+        duration = last.duration if last.prefetch else sum(segment.duration for segment in segments) / float(len(segments))
+
+        # Use the last duration for extrapolating the start time of the prefetch segment, which is needed for checking
+        # whether it is an ad segment and matches the parsed date ranges or not
+        date = last.date + timedelta(seconds=last.duration)
+
+        # Always treat prefetch segments after a discontinuity as ad segments
+        # (discontinuity tag inserted after last regular segment)
+        # Don't reset discontinuity state: the date extrapolation might be inaccurate,
+        # so all following prefetch segments should be considered an ad after a discontinuity
+        ad = self._discontinuity or self._is_segment_ad(date)
+
+        # Since we don't reset the discontinuity state in prefetch segments for the purpose of ad detection,
+        # set the prefetch segment's discontinuity attribute based on ad transitions
+        discontinuity = ad != last.ad
+
+        segment = dataclass_replace(
+            last,
+            uri=self.uri(value),
+            duration=duration,
+            title=None,
+            discontinuity=discontinuity,
+            date=date,
+            ad=ad,
+            prefetch=True,
         )
-    },
-    validate.get("quality_options")
-)
+        segments.append(segment)
 
+    @parse_tag("EXT-X-DATERANGE")
+    def parse_tag_ext_x_daterange(self, value):
+        super().parse_tag_ext_x_daterange(value)
+        daterange = self.m3u8.dateranges[-1]
+        if self._is_daterange_ad(daterange):
+            self.m3u8.dateranges_ads.append(daterange)
 
-Segment = namedtuple("Segment", "uri duration title key discontinuity scte35 byterange date map")
+    def get_segment(self, uri: str, **data) -> TwitchHLSSegment:
+        ad = self._is_segment_ad(self._date, self._extinf.title if self._extinf else None)
+        segment: TwitchHLSSegment = super().get_segment(uri, ad=ad, prefetch=False)  # type: ignore[assignment]
 
+        # Special case where Twitch incorrectly inserts discontinuity tags between segments of the live content
+        if (
+            segment.discontinuity
+            and not segment.ad
+            and self.m3u8.segments
+            and not self.m3u8.segments[-1].ad
+        ):  # fmt: skip
+            segment.discontinuity = False
 
-class TwitchM3U8Parser(M3U8Parser):
-    def parse_tag_ext_x_scte35_out(self, value):
-        self.state["scte35"] = True
+        return segment
 
-    # unsure if this gets used by Twitch
-    def parse_tag_ext_x_scte35_out_cont(self, value):
-        self.state["scte35"] = True
+    def _is_segment_ad(self, date: datetime | None, title: str | None = None) -> bool:
+        return (
+            title is not None and "Amazon" in title
+            or any(self.m3u8.is_date_in_daterange(date, daterange) for daterange in self.m3u8.dateranges_ads)
+        )  # fmt: skip
 
-    def parse_tag_ext_x_scte35_in(self, value):
-        self.state["scte35"] = False
-
-    def get_segment(self, uri):
-        byterange = self.state.pop("byterange", None)
-        extinf = self.state.pop("extinf", (0, None))
-        date = self.state.pop("date", None)
-        map_ = self.state.get("map")
-        key = self.state.get("key")
-        discontinuity = self.state.pop("discontinuity", False)
-        scte35 = self.state.pop("scte35", None)
-
-        return Segment(
-            uri,
-            extinf[0],
-            extinf[1],
-            key,
-            discontinuity,
-            scte35,
-            byterange,
-            date,
-            map_
+    @staticmethod
+    def _is_daterange_ad(daterange: DateRange) -> bool:
+        return (
+            daterange.classname == "twitch-stitched-ad"
+            or str(daterange.id or "").startswith("stitched-ad-")
+            or any(attr_key.startswith("X-TV-TWITCH-AD-") for attr_key in daterange.x.keys())
         )
 
 
 class TwitchHLSStreamWorker(HLSStreamWorker):
-    def _reload_playlist(self, text, url):
-        return load_hls_playlist(text, url, parser=TwitchM3U8Parser)
+    reader: TwitchHLSStreamReader
+    writer: TwitchHLSStreamWriter
+    stream: TwitchHLSStream
+
+    def __init__(self, reader, *args, **kwargs) -> None:
+        self.had_content: bool = False
+        self.logged_ads: deque[str] = deque(maxlen=10)
+        super().__init__(reader, *args, **kwargs)
+
+    def _playlist_reload_time(self, playlist: TwitchM3U8):  # type: ignore[override]
+        if self.stream.low_latency and playlist.segments:
+            return playlist.segments[-1].duration
+
+        return super()._playlist_reload_time(playlist)
+
+    def process_segments(self, playlist: TwitchM3U8):  # type: ignore[override]
+        # ignore prefetch segments if not LL streaming
+        if not self.stream.low_latency:
+            playlist.segments = [segment for segment in playlist.segments if not segment.prefetch]
+
+        # check for sequences with real content
+        if not self.had_content:
+            self.had_content = next((True for segment in playlist.segments if not segment.ad), False)
+
+            # When filtering ads, to check whether it's a LL stream, we need to wait for the real content to show up,
+            # since playlists with only ad segments don't contain prefetch segments
+            if (
+                self.stream.low_latency
+                and self.had_content
+                and not next((True for segment in playlist.segments if segment.prefetch), False)
+            ):
+                log.info("This is not a low latency stream")
+
+        # show pre-roll ads message only on the first playlist containing ads
+        if self.stream.disable_ads and self.playlist_sequence == -1 and not self.had_content:
+            log.info("Waiting for pre-roll ads to finish, be patient")
+
+        # log the duration of whole advertisement breaks
+        for daterange_ads in playlist.dateranges_ads:
+            if not daterange_ads.duration:  # pragma: no cover
+                continue
+
+            ads_id: str | None = (
+                daterange_ads.x.get("X-TV-TWITCH-AD-COMMERCIAL-ID")
+                or daterange_ads.x.get("X-TV-TWITCH-AD-ROLL-TYPE")
+            )  # fmt: skip
+            if not ads_id or ads_id in self.logged_ads:
+                continue
+            self.logged_ads.append(ads_id)
+
+            # use Twitch's own ads duration metadata if available
+            try:
+                duration = math.ceil(float(daterange_ads.x.get("X-TV-TWITCH-AD-POD-FILLED-DURATION", "")))
+            except ValueError:
+                duration = math.ceil(daterange_ads.duration.total_seconds())
+
+            log.info(f"Detected advertisement break of {duration} second{'s' if duration != 1 else ''}")
+
+        return super().process_segments(playlist)
 
 
 class TwitchHLSStreamWriter(HLSStreamWriter):
-    def __init__(self, *args, **kwargs):
-        HLSStreamWriter.__init__(self, *args, **kwargs)
-        options = self.session.plugins.get("twitch").options
-        self.disable_ads = options.get("disable-ads")
-        if self.disable_ads:
-            log.info("Will skip ad segments")
+    reader: TwitchHLSStreamReader
+    stream: TwitchHLSStream
 
-    def write(self, sequence, *args, **kwargs):
-        if self.disable_ads:
-            if sequence.segment.scte35 is not None:
-                self.reader.ads = sequence.segment.scte35
-                if self.reader.ads:
-                    log.info("Will skip ads beginning with segment {0}".format(sequence.num))
-                else:
-                    log.info("Will stop skipping ads beginning with segment {0}".format(sequence.num))
-            if self.reader.ads:
-                return
-        return HLSStreamWriter.write(self, sequence, *args, **kwargs)
+    def should_filter_segment(self, segment: TwitchHLSSegment) -> bool:  # type: ignore[override]
+        return self.stream.disable_ads and segment.ad
 
 
 class TwitchHLSStreamReader(HLSStreamReader):
     __worker__ = TwitchHLSStreamWorker
     __writer__ = TwitchHLSStreamWriter
-    ads = None
+
+    worker: TwitchHLSStreamWorker
+    writer: TwitchHLSStreamWriter
+    stream: TwitchHLSStream
+
+    def __init__(self, stream: TwitchHLSStream):
+        if stream.disable_ads:
+            log.info("Will skip ad segments")
+        if stream.low_latency:
+            live_edge = max(1, min(LOW_LATENCY_MAX_LIVE_EDGE, stream.session.options.get("hls-live-edge")))
+            stream.session.options.set("hls-live-edge", live_edge)
+            stream.session.options.set("hls-segment-stream-data", True)
+            log.info(f"Low latency streaming (HLS live edge: {live_edge})")
+        super().__init__(stream)
 
 
 class TwitchHLSStream(HLSStream):
-    def open(self):
-        reader = TwitchHLSStreamReader(self)
-        reader.open()
+    __reader__ = TwitchHLSStreamReader
+    __parser__ = TwitchM3U8Parser
 
-        return reader
+    def __init__(self, *args, disable_ads: bool = False, low_latency: bool = False, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.disable_ads = disable_ads
+        self.low_latency = low_latency
 
 
-class UsherService(object):
+class UsherService:
     def __init__(self, session):
         self.session = session
 
     def _create_url(self, endpoint, **extra_params):
-        url = "https://usher.ttvnw.net{0}".format(endpoint)
+        url = f"https://usher.ttvnw.net{endpoint}"
         params = {
             "player": "twitchweb",
             "p": int(random() * 999999),
@@ -227,551 +273,713 @@ class UsherService(object):
         }
         params.update(extra_params)
 
-        req = requests.Request("GET", url, params=params)
-        # prepare_request is only available in requests 2.0+
-        if hasattr(self.session.http, "prepare_request"):
-            req = self.session.http.prepare_request(req)
-        else:
-            req = req.prepare()
+        req = self.session.http.prepare_new_request(url=url, params=params)
 
         return req.url
 
-    def channel(self, channel, **extra_params):
-        return self._create_url("/api/channel/hls/{0}.m3u8".format(channel),
-                                **extra_params)
+    def channel(self, channel: str, **extra_params) -> str:
+        with suppress(PluginError):
+            extra_params_debug = validate.Schema(
+                validate.get("token"),
+                validate.parse_json(),
+                {
+                    "adblock": bool,
+                    "geoblock_reason": str,
+                    "hide_ads": bool,
+                    "server_ads": bool,
+                    "show_ads": bool,
+                },
+            ).validate(extra_params)
+            log.debug(f"{extra_params_debug!r}")
 
-    def video(self, video_id, **extra_params):
-        return self._create_url("/vod/{0}".format(video_id), **extra_params)
+        return self._create_url(f"/api/channel/hls/{channel.lower()}.m3u8", **extra_params)
+
+    def video(self, video_id: str, **extra_params) -> str:
+        return self._create_url(f"/vod/{video_id}", **extra_params)
 
 
-class TwitchAPI(object):
-    def __init__(self, session, beta=False, version=3):
-        self.oauth_token = None
+class TwitchAPI:
+    CLIENT_ID = "kimne78kx3ncx6brgo4mv6wki5h1ko"
+
+    def __init__(self, session, api_header=None, access_token_param=None):
         self.session = session
-        self.subdomain = beta and "betaapi" or "api"
-        self.version = version
+        self.headers = {
+            "Client-ID": self.CLIENT_ID,
+        }
+        self.headers.update(**dict(api_header or []))
+        self.access_token_params = dict(access_token_param or [])
+        self.access_token_params.setdefault("playerType", "embed")
 
-    def add_cookies(self, cookies):
-        self.session.http.parse_cookies(cookies, domain="twitch.tv")
+    def call(self, data, schema=None, **kwargs):
+        res = self.session.http.post(
+            "https://gql.twitch.tv/gql",
+            json=data,
+            headers={**self.headers, **kwargs.pop("headers", {})},
+            **kwargs,
+        )
 
-    def call(self, path, format="json", schema=None, **extra_params):
-        params = dict(as3="t", **extra_params)
+        return self.session.http.json(res, schema=schema)
 
-        if self.oauth_token:
-            params["oauth_token"] = self.oauth_token
+    @staticmethod
+    def _gql_persisted_query(operationname, sha256hash, **variables):
+        return {
+            "operationName": operationname,
+            "extensions": {
+                "persistedQuery": {
+                    "version": 1,
+                    "sha256Hash": sha256hash,
+                },
+            },
+            "variables": dict(**variables),
+        }
 
-        if len(format) > 0:
-            url = "https://{0}.twitch.tv{1}.{2}".format(self.subdomain, path, format)
-        else:
-            url = "https://{0}.twitch.tv{1}".format(self.subdomain, path)
+    @staticmethod
+    def parse_token(tokenstr):
+        return parse_json(
+            tokenstr,
+            schema=validate.Schema(
+                {
+                    "chansub": {
+                        "restricted_bitrates": validate.all(
+                            [str],
+                            validate.filter(lambda n: not re.match(r"(.+_)?archives|live|chunked", n)),
+                        ),
+                    },
+                },
+                validate.get(("chansub", "restricted_bitrates")),
+            ),
+        )
 
-        headers = {'Accept': 'application/vnd.twitchtv.v{0}+json'.format(self.version),
-                   'Client-ID': TWITCH_CLIENT_ID}
+    # GraphQL API calls
 
-        res = self.session.http.get(url, params=params, headers=headers)
+    def metadata_video(self, video_id):
+        query = self._gql_persisted_query(
+            "VideoMetadata",
+            "cb3b1eb2f2d2b2f65b8389ba446ec521d76c3aa44f5424a1b1d235fe21eb4806",
+            channelLogin="",  # parameter can be empty
+            videoID=video_id,
+        )
 
-        if format == "json":
-            return self.session.http.json(res, schema=schema)
-        else:
-            return res
+        return self.call(
+            query,
+            schema=validate.Schema(
+                {
+                    "data": {
+                        "video": {
+                            "id": str,
+                            "owner": {
+                                "displayName": str,
+                            },
+                            "title": str,
+                            "game": {
+                                "displayName": str,
+                            },
+                        },
+                    },
+                },
+                validate.get(("data", "video")),
+                validate.union_get(
+                    "id",
+                    ("owner", "displayName"),
+                    ("game", "displayName"),
+                    "title",
+                ),
+            ),
+        )
 
-    def call_subdomain(self, subdomain, path, format="json", schema=None, **extra_params):
-        subdomain_buffer = self.subdomain
-        self.subdomain = subdomain
-        response = self.call(path, format=format, schema=schema, **extra_params)
-        self.subdomain = subdomain_buffer
-        return response
+    def metadata_channel(self, channel):
+        queries = [
+            self._gql_persisted_query(
+                "ChannelShell",
+                "c3ea5a669ec074a58df5c11ce3c27093fa38534c94286dc14b68a25d5adcbf55",
+                login=channel,
+                lcpVideosEnabled=False,
+            ),
+            self._gql_persisted_query(
+                "StreamMetadata",
+                "059c4653b788f5bdb2f5a2d2a24b0ddc3831a15079001a3d927556a96fb0517f",
+                channelLogin=channel,
+            ),
+        ]
 
-    # Public API calls
+        return self.call(
+            queries,
+            schema=validate.Schema(
+                [
+                    validate.all(
+                        {
+                            "data": {
+                                "userOrError": {
+                                    "displayName": str,
+                                },
+                            },
+                        },
+                    ),
+                    validate.all(
+                        {
+                            "data": {
+                                "user": {
+                                    "lastBroadcast": {
+                                        "title": str,
+                                    },
+                                    "stream": {
+                                        "id": str,
+                                        "game": {
+                                            "name": str,
+                                        },
+                                    },
+                                },
+                            },
+                        },
+                    ),
+                ],
+                validate.union_get(
+                    (1, "data", "user", "stream", "id"),
+                    (0, "data", "userOrError", "displayName"),
+                    (1, "data", "user", "stream", "game", "name"),
+                    (1, "data", "user", "lastBroadcast", "title"),
+                ),
+            ),
+        )
 
-    def user(self, **params):
-        return self.call("/kraken/user", **params)
+    def metadata_clips(self, clipname):
+        queries = [
+            self._gql_persisted_query(
+                "ClipsView",
+                "4480c1dcc2494a17bb6ef64b94a5213a956afb8a45fe314c66b0d04079a93a8f",
+                slug=clipname,
+            ),
+            self._gql_persisted_query(
+                "ClipsTitle",
+                "f6cca7f2fdfbfc2cecea0c88452500dae569191e58a265f97711f8f2a838f5b4",
+                slug=clipname,
+            ),
+        ]
 
-    def users(self, **params):
-        return self.call("/kraken/users", **params)
+        return self.call(
+            queries,
+            schema=validate.Schema(
+                [
+                    validate.all(
+                        {
+                            "data": {
+                                "clip": {
+                                    "id": str,
+                                    "broadcaster": {"displayName": str},
+                                    "game": {"name": str},
+                                },
+                            },
+                        },
+                        validate.get(("data", "clip")),
+                    ),
+                    validate.all(
+                        {"data": {"clip": {"title": str}}},
+                        validate.get(("data", "clip")),
+                    ),
+                ],
+                validate.union_get(
+                    (0, "id"),
+                    (0, "broadcaster", "displayName"),
+                    (0, "game", "name"),
+                    (1, "title"),
+                ),
+            ),
+        )
 
-    def videos(self, video_id, **params):
-        return self.call("/kraken/videos/{0}".format(video_id), **params)
+    def access_token(self, is_live, channel_or_vod, client_integrity: tuple[str, str] | None = None):
+        query = self._gql_persisted_query(
+            "PlaybackAccessToken",
+            "0828119ded1c13477966434e15800ff57ddacf13ba1911c129dc2200705b0712",
+            isLive=is_live,
+            login=channel_or_vod if is_live else "",
+            isVod=not is_live,
+            vodID=channel_or_vod if not is_live else "",
+            **self.access_token_params,
+        )
+        subschema = validate.none_or_all(
+            {
+                "value": str,
+                "signature": str,
+            },
+            validate.union_get("signature", "value"),
+        )
 
-    def channel_info(self, channel, **params):
-        return self.call("/kraken/channels/{0}".format(channel), **params)
+        headers = {}
+        if client_integrity:
+            headers["Device-Id"], headers["Client-Integrity"] = client_integrity
 
-    def streams(self, channel_id, **params):
-        return self.call("/kraken/streams/{0}".format(channel_id), **params)
+        return self.call(
+            query,
+            acceptable_status=(200, 400, 401, 403),
+            headers=headers,
+            schema=validate.Schema(
+                validate.any(
+                    validate.all(
+                        {"errors": [{"message": str}]},
+                        validate.get(("errors", 0, "message")),
+                        validate.transform(lambda data: ("error", None, data)),
+                    ),
+                    validate.all(
+                        {"error": str, "message": str},
+                        validate.union_get("error", "message"),
+                        validate.transform(lambda data: ("error", *data)),
+                    ),
+                    validate.all(
+                        {
+                            "data": validate.any(
+                                validate.all(
+                                    {"streamPlaybackAccessToken": subschema},
+                                    validate.get("streamPlaybackAccessToken"),
+                                ),
+                                validate.all(
+                                    {"videoPlaybackAccessToken": subschema},
+                                    validate.get("videoPlaybackAccessToken"),
+                                ),
+                            ),
+                        },
+                        validate.get("data"),
+                        validate.transform(lambda data: ("token", *data) if data is not None else ("token", None, None)),
+                    ),
+                ),
+            ),
+        )
 
-    def clips(self, clip_name, **params):
-        return self.call("/kraken/clips/{0}".format(clip_name), **params)
+    def clips(self, clipname):
+        query = self._gql_persisted_query(
+            "VideoAccessToken_Clip",
+            "36b89d2507fce29e5ca551df756d27c1cfe079e2609642b4390aa4c35796eb11",
+            slug=clipname,
+        )
 
-    # Private API calls
+        return self.call(
+            query,
+            schema=validate.Schema(
+                {
+                    "data": {
+                        "clip": {
+                            "playbackAccessToken": {
+                                "signature": str,
+                                "value": str,
+                            },
+                            "videoQualities": [
+                                validate.all(
+                                    {
+                                        "frameRate": validate.transform(int),
+                                        "quality": str,
+                                        "sourceURL": validate.url(),
+                                    },
+                                    validate.transform(
+                                        lambda q: (
+                                            f"{q['quality']}p{q['frameRate']}",
+                                            q["sourceURL"],
+                                        ),
+                                    ),
+                                ),
+                            ],
+                        },
+                    },
+                },
+                validate.get(("data", "clip")),
+                validate.union_get(
+                    ("playbackAccessToken", "signature"),
+                    ("playbackAccessToken", "value"),
+                    "videoQualities",
+                ),
+            ),
+        )
 
-    def access_token(self, endpoint, asset, **params):
-        return self.call("/api/{0}/{1}/access_token".format(endpoint, asset), **dict(platform="_", **params))
 
-    def token(self, **params):
-        return self.call("/api/viewer/token", **params)
+class TwitchClientIntegrity:
+    URL_P_SCRIPT = "https://k.twitchcdn.net/149e9513-01fa-4fb0-aad4-566afd725d1b/2d206a39-8ed7-437e-a3be-862e0f06eea3/p.js"
 
-    def viewer_info(self, **params):
-        return self.call("/api/viewer/info", **params)
+    # language=javascript
+    JS_INTEGRITY_TOKEN = """
+    // noinspection JSIgnoredPromiseFromCall
+    new Promise((resolve, reject) => {
+        function configureKPSDK() {
+            // noinspection JSUnresolvedVariable,JSUnresolvedFunction
+            window.KPSDK.configure([{
+                "protocol": "https:",
+                "method": "POST",
+                "domain": "gql.twitch.tv",
+                "path": "/integrity"
+            }]);
+        }
 
-    def hosted_channel(self, **params):
-        return self.call_subdomain("tmi", "/hosts", format="", **params)
+        async function fetchIntegrity() {
+            // noinspection JSUnresolvedReference
+            const headers = Object.assign(HEADERS, {"x-device-id": "DEVICE_ID"});
+            // window.fetch gets overridden and the patched function needs to be used
+            const resp = await window.fetch("https://gql.twitch.tv/integrity", {
+                "headers": headers,
+                "body": null,
+                "method": "POST",
+                "mode": "cors",
+                "credentials": "omit"
+            });
 
-    def clip_status(self, channel, clip_name, schema):
-        return self.session.http.json(self.call_subdomain("clips", "/api/v2/clips/" + clip_name + "/status", format=""),
-                                      schema=schema)
+            if (resp.status !== 200) {
+                throw new Error(`Unexpected integrity response status code ${resp.status}`);
+            }
 
-    # Unsupported/Removed private API calls
+            return JSON.stringify(await resp.json());
+        }
 
-    def channel_viewer_info(self, channel, **params):
-        warnings.warn("The channel_viewer_info API call is unsupported and may stop working at any time")
-        return self.call("/api/channels/{0}/viewer".format(channel), **params)
+        document.addEventListener("kpsdk-load", configureKPSDK, {once: true});
+        document.addEventListener("kpsdk-ready", () => fetchIntegrity().then(resolve, reject), {once: true});
 
-    def channel_subscription(self, channel, **params):
-        warnings.warn("The channel_subscription API call has been removed and no longer works",
-                      category=DeprecationWarning)
-        return self.call("/api/channels/{0}/subscription".format(channel), **params)
+        const script = document.createElement("script");
+        script.addEventListener("error", reject);
+        script.src = "SCRIPT_SOURCE";
+        document.body.appendChild(script);
+    });
+    """
+
+    @classmethod
+    def acquire(
+        cls,
+        session: Streamlink,
+        channel: str,
+        headers: Mapping[str, str],
+        device_id: str,
+    ) -> tuple[str, int] | None:
+        from streamlink.compat import BaseExceptionGroup  # noqa: PLC0415
+        from streamlink.webbrowser.cdp import CDPClient, CDPClientSession, devtools  # noqa: PLC0415
+
+        url = f"https://www.twitch.tv/{channel}"
+        js_get_integrity_token = cls.JS_INTEGRITY_TOKEN \
+            .replace("SCRIPT_SOURCE", cls.URL_P_SCRIPT) \
+            .replace("HEADERS", json_dumps(headers)) \
+            .replace("DEVICE_ID", device_id)  # fmt: skip
+        eval_timeout = session.get_option("webbrowser-timeout")
+        # noinspection PyUnusedLocal
+        client_integrity: str | None = None
+
+        async def on_main(client_session: CDPClientSession, request: devtools.fetch.RequestPaused):
+            async with client_session.alter_request(request) as cm:
+                cm.body = "<!doctype html>"
+
+        async def acquire_client_integrity_token(client: CDPClient):
+            client_session: CDPClientSession
+            async with client.session() as client_session:
+                client_session.add_request_handler(on_main, url_pattern=url, on_request=True)
+                async with client_session.navigate(url) as frame_id:
+                    await client_session.loaded(frame_id)
+                    return await client_session.evaluate(js_get_integrity_token, timeout=eval_timeout)
+
+        try:
+            client_integrity = CDPClient.launch(session, acquire_client_integrity_token)
+        except BaseExceptionGroup:
+            log.exception("Failed acquiring client integrity token")
+        except Exception as err:
+            log.error(err)
+
+        if not client_integrity:
+            return None
+
+        schema = validate.Schema(
+            validate.parse_json(),
+            {"token": str, "expiration": int},
+            validate.union_get("token", "expiration"),
+        )
+        token, expiration = schema.validate(client_integrity)
+
+        return token, expiration / 1000
 
 
-class Twitch(Plugin):
-    arguments = PluginArguments(
-        PluginArgument("oauth-token",
-                       sensitive=True,
-                       metavar="TOKEN",
-                       help="""
-        An OAuth token to use for Twitch authentication.
-        Use --twitch-oauth-authenticate to create a token.
-        """),
-        PluginArgument("cookie",
-                       sensitive=True,
-                       metavar="COOKIES",
-                       help="""
-        Twitch cookies to authenticate to allow access to subscription channels.
-
-        Example:
-
-          "_twitch_session_id=xxxxxx; persistent=xxxxx"
-
-        Note: This method is the old and clunky way of authenticating with
-        Twitch, using --twitch-oauth-authenticate is the recommended and
-        simpler way of doing it now.
-        """
-                       ),
-        PluginArgument("disable-hosting",
-                       action="store_true",
-                       help="""
-        Do not open the stream if the target channel is hosting another channel.
-        """
-                       ),
-        PluginArgument("disable-ads",
-                       action="store_true",
-                       help="""
+@pluginmatcher(
+    name="player",
+    pattern=re.compile(
+        r"https?://player\.twitch\.tv/\?.+",
+    ),
+)
+@pluginmatcher(
+    name="clip",
+    pattern=re.compile(
+        r"https?://(?:clips\.twitch\.tv|(?:[\w-]+\.)?twitch\.tv/(?:[\w-]+/)?clip)/(?P<clip_id>[^/?]+)",
+    ),
+)
+@pluginmatcher(
+    name="vod",
+    pattern=re.compile(
+        r"https?://(?:[\w-]+\.)?twitch\.tv/(?:[\w-]+/)?v(?:ideos?)?/(?P<video_id>\d+)",
+    ),
+)
+@pluginmatcher(
+    name="live",
+    pattern=re.compile(
+        r"https?://(?:(?!clips\.)[\w-]+\.)?twitch\.tv/(?P<channel>(?!v(?:ideos?)?/|clip/)[^/?]+)/?(?:\?|$)",
+    ),
+)
+@pluginargument(
+    "disable-ads",
+    action="store_true",
+    help="""
         Skip embedded advertisement segments at the beginning or during a stream.
-        Will cause these segments to be missing from the stream.
-        """
-                       ))
+        Will cause these segments to be missing from the output.
+    """,
+)
+@pluginargument(
+    "disable-hosting",
+    action="store_true",
+    help=argparse.SUPPRESS,
+)
+@pluginargument(
+    "disable-reruns",
+    action="store_true",
+    help=argparse.SUPPRESS,
+)
+@pluginargument(
+    "low-latency",
+    action="store_true",
+    help="""
+        Enables low latency streaming by prefetching HLS segments.
+        Sets --hls-segment-stream-data to true and --hls-live-edge to 2, if it is higher.
+        Reducing --hls-live-edge to `1` will result in the lowest latency possible, but will most likely cause buffering.
+
+        In order to achieve true low latency streaming during playback, the player's caching/buffering settings will
+        need to be adjusted and reduced to a value as low as possible, but still high enough to not cause any buffering.
+        This depends on the stream's bitrate and the quality of the connection to Twitch's servers. Please refer to the
+        player's own documentation for the required configuration. Player parameters can be set via --player-args.
+
+        Note: Low latency streams have to be enabled by the broadcasters on Twitch themselves.
+        Regular streams can cause buffering issues with this option enabled due to the reduced --hls-live-edge value.
+    """,
+)
+@pluginargument(
+    "api-header",
+    metavar="KEY=VALUE",
+    type="keyvalue",
+    action="append",
+    help="""
+        A header to add to each Twitch API HTTP request.
+
+        Can be repeated to add multiple headers.
+
+        Useful for adding authentication data that can prevent ads. See the plugin-specific documentation for more information.
+    """,
+)
+@pluginargument(
+    "access-token-param",
+    metavar="KEY=VALUE",
+    type="keyvalue",
+    action="append",
+    help="""
+        A parameter to add to the API request for acquiring the streaming access token.
+
+        Can be repeated to add multiple parameters.
+    """,
+)
+@pluginargument(
+    "force-client-integrity",
+    action="store_true",
+    help="Don't attempt requesting the streaming access token without a client-integrity token.",
+)
+@pluginargument(
+    "purge-client-integrity",
+    action="store_true",
+    help="Purge cached Twitch client-integrity token and acquire a new one.",
+)
+class Twitch(Plugin):
+    _CACHE_KEY_CLIENT_INTEGRITY = "client-integrity"
 
     @classmethod
-    def stream_weight(cls, key):
-        weight = QUALITY_WEIGHTS.get(key)
-        if weight:
-            return weight, "twitch"
+    def stream_weight(cls, stream):
+        if stream == "source":
+            return sys.maxsize, stream
+        return super().stream_weight(stream)
 
-        return Plugin.stream_weight(key)
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
 
-    @classmethod
-    def can_handle_url(cls, url):
-        return _url_re.match(url)
+        params = parse_qsd(urlparse(self.url).query)
 
-    def _get_metadata(self):
-        if self.video_id:
-            api_res = self.api.videos(self.video_id)
-            self.title = api_res["title"]
-            self.author = api_res["channel"]["display_name"]
-            self.category = api_res["game"]
-        elif self.clip_name:
-            api_res = self.api.clips(self.clip_name)
-            self.title = api_res["title"]
-            self.author = api_res["broadcaster"]["display_name"]
-            self.category = api_res["game"]
-        elif self._channel:
-            api_res = self.api.streams(self.channel_id)["stream"]["channel"]
-            self.title = api_res["status"]
-            self.author = api_res["display_name"]
-            self.category = api_res["game"]
+        self.channel = self.match["channel"] if self.matches["live"] else None
+        self.video_id = self.match["video_id"] if self.matches["vod"] else None
+        self.clip_id = self.match["clip_id"] if self.matches["clip"] else None
 
-    def get_title(self):
-        if self.title is None:
-            self._get_metadata()
-        return self.title
+        if self.matches["player"]:
+            self.channel = params.get("channel")
+            self.video_id = params.get("video")
 
-    def get_author(self):
-        if self.author is None:
-            self._get_metadata()
-        return self.author
+        try:
+            self.time_offset = hours_minutes_seconds_float(params.get("t", "0"))
+        except ValueError:
+            self.time_offset = 0
 
-    def get_category(self):
-        if self.category is None:
-            self._get_metadata()
-        return self.category
-
-    def __init__(self, url):
-        Plugin.__init__(self, url)
-        self._hosted_chain = []
-        match = _url_re.match(url).groupdict()
-        parsed = urlparse(url)
-        self.params = parse_query(parsed.query)
-        self.subdomain = match.get("subdomain")
-        self.video_id = None
-        self.video_type = None
-        self._channel_id = None
-        self._channel = None
-        self.clip_name = None
-        self.title = None
-        self.author = None
-        self.category = None
-
-        if self.subdomain == "player":
-            # pop-out player
-            if self.params.get("video"):
-                try:
-                    self.video_type = self.params["video"][0]
-                    self.video_id = self.params["video"][1:]
-                except IndexError:
-                    self.logger.debug("Invalid video param: {0}", self.params["video"])
-            self._channel = self.params.get("channel")
-        elif self.subdomain == "clips":
-            # clip share URL
-            self.clip_name = match.get("channel")
-        else:
-            self._channel = match.get("channel") and match.get("channel").lower()
-            self.video_type = match.get("video_type")
-            if match.get("videos_id"):
-                self.video_type = "v"
-            self.video_id = match.get("video_id") or match.get("videos_id")
-            self.clip_name = match.get("clip_name")
-
-        self.api = TwitchAPI(beta=self.subdomain == "beta",
-                             session=self.session,
-                             version=5)
+        self.api = TwitchAPI(
+            session=self.session,
+            api_header=self.get_option("api-header"),
+            access_token_param=self.get_option("access-token-param"),
+        )
         self.usher = UsherService(session=self.session)
 
-    @property
-    def channel(self):
-        if not self._channel:
+        self._checked_metadata = False
+
+        def method_factory(parent_method):
+            def inner():
+                if not self._checked_metadata:
+                    self._checked_metadata = True
+                    self._get_metadata()
+                return parent_method()
+
+            return inner
+
+        parent = super()
+        for metadata in "id", "author", "category", "title":
+            method = f"get_{metadata}"
+            setattr(self, method, method_factory(getattr(parent, method)))
+
+    def _get_metadata(self):
+        try:
             if self.video_id:
-                cdata = self._channel_from_video_id(self.video_id)
-                self._channel = cdata["name"].lower()
-                self._channel_id = cdata["_id"]
-        return self._channel
+                data = self.api.metadata_video(self.video_id)
+            elif self.clip_id:
+                data = self.api.metadata_clips(self.clip_id)
+            elif self.channel:
+                data = self.api.metadata_channel(self.channel)
+            else:  # pragma: no cover
+                return
+            self.id, self.author, self.category, self.title = data
+        except (PluginError, TypeError):
+            pass
 
-    @channel.setter
-    def channel(self, channel):
-        self._channel = channel
-        # channel id becomes unknown
-        self._channel_id = None
+    def _client_integrity_token(self, channel: str) -> tuple[str, str] | None:
+        if self.options.get("purge-client-integrity"):
+            log.info("Removing cached client-integrity token...")
+            self.cache.set(self._CACHE_KEY_CLIENT_INTEGRITY, None, 0)
 
-    @property
-    def channel_id(self):
-        if not self._channel_id:
-            # If the channel name is set, use that to look up the ID
-            if self._channel:
-                cdata = self._channel_from_login(self._channel)
-                self._channel_id = cdata["_id"]
-
-            # If the channel name is not set but the video ID is,
-            # use that to look up both ID and name
-            elif self.video_id:
-                cdata = self._channel_from_video_id(self.video_id)
-                self._channel = cdata["name"].lower()
-                self._channel_id = cdata["_id"]
-        return self._channel_id
-
-    def _channel_from_video_id(self, video_id):
-        vdata = self.api.videos(video_id)
-        if "channel" not in vdata:
-            raise PluginError("Unable to find video: {0}".format(video_id))
-        return vdata["channel"]
-
-    def _channel_from_login(self, channel):
-        cdata = self.api.users(login=channel)
-        if len(cdata["users"]):
-            return cdata["users"][0]
+        client_integrity = self.cache.get(self._CACHE_KEY_CLIENT_INTEGRITY)
+        if client_integrity and isinstance(client_integrity, list) and len(client_integrity) == 2:
+            log.info("Using cached client-integrity token")
+            device_id, token = client_integrity
         else:
-            raise PluginError("Unable to find channel: {0}".format(channel))
+            log.info("Acquiring new client-integrity token...")
+            device_id = random_token(32, CHOICES_ALPHA_NUM)
+            client_integrity = TwitchClientIntegrity.acquire(
+                self.session,
+                channel,
+                self.api.headers,
+                device_id,
+            )
+            if not client_integrity:
+                log.warning("No client-integrity token acquired")
+                return None
 
-    def _authenticate(self):
-        if self.api.oauth_token:
-            return
+            token, expiration = client_integrity
+            self.cache.set(self._CACHE_KEY_CLIENT_INTEGRITY, [device_id, token], expires_at=fromtimestamp(expiration))
 
-        oauth_token = self.options.get("oauth_token")
-        cookies = self.options.get("cookie")
+        return device_id, token
 
-        if oauth_token:
-            self.logger.info("Attempting to authenticate using OAuth token")
-            self.api.oauth_token = oauth_token
-            user = self.api.user(schema=_user_schema)
+    def _access_token(self, is_live, channel_or_vod):
+        response = ""
+        data = (None, None)
 
-            if user:
-                self.logger.info("Successfully logged in as {0}", user)
-            else:
-                self.logger.error("Failed to authenticate, the access token "
-                                  "is invalid or missing required scope")
-        elif cookies:
-            self.logger.info("Attempting to authenticate using cookies")
+        # try without a client-integrity token first (the web player did the same on 2023-05-31)
+        if not self.options.get("force-client-integrity"):
+            response, *data = self.api.access_token(is_live, channel_or_vod)
 
-            self.api.add_cookies(cookies)
-            self.api.oauth_token = self.api.token(schema=_viewer_token_schema)
-            login = self.api.viewer_info(schema=_viewer_info_schema)
+        # try again with a client-integrity token if the API response was erroneous
+        if response != "token":
+            client_integrity = self._client_integrity_token(channel_or_vod) if is_live else None
+            response, *data = self.api.access_token(is_live, channel_or_vod, client_integrity)
 
-            if login:
-                self.logger.info("Successfully logged in as {0}", login)
-            else:
-                self.logger.error("Failed to authenticate, your cookies "
-                                  "may have expired")
+            # unknown API response error: abort
+            if response != "token":
+                error, message = data
+                raise PluginError(f"{error or 'Error'}: {message or 'Unknown error'}")
 
-    def _create_playlist_streams(self, videos):
-        start_offset = int(videos.get("start_offset", 0))
-        stop_offset = int(videos.get("end_offset", 0))
-        streams = {}
+        # access token response was empty: stream is offline or channel doesn't exist
+        if response == "token" and data[0] is None:
+            raise NoStreamsError
 
-        for quality, chunks in videos.get("chunks").items():
-            if not chunks:
-                if videos.get("restrictions", {}).get(quality) == "chansub":
-                    self.logger.warning("The quality '{0}' is not available "
-                                        "since it requires a subscription.",
-                                        quality)
-                continue
-
-            # Rename 'live' to 'source'
-            if quality == "live":
-                quality = "source"
-
-            chunks_filtered = list(filter(lambda c: c["url"], chunks))
-            if len(chunks) != len(chunks_filtered):
-                self.logger.warning("The video '{0}' contains invalid chunks. "
-                                    "There will be missing data.", quality)
-                chunks = chunks_filtered
-
-            chunks_duration = sum(c.get("length") for c in chunks)
-
-            # If it's a full broadcast we just use all the chunks
-            if start_offset == 0 and chunks_duration == stop_offset:
-                # No need to use the FLV concat if it's just one chunk
-                if len(chunks) == 1:
-                    url = chunks[0].get("url")
-                    stream = HTTPStream(self.session, url)
-                else:
-                    chunks = [HTTPStream(self.session, c.get("url")) for c in chunks]
-                    stream = FLVPlaylist(self.session, chunks,
-                                         duration=chunks_duration)
-            else:
-                try:
-                    stream = self._create_video_clip(chunks,
-                                                     start_offset,
-                                                     stop_offset)
-                except StreamError as err:
-                    self.logger.error("Error while creating video '{0}': {1}",
-                                      quality, err)
-                    continue
-
-            streams[quality] = stream
-
-        return streams
-
-    def _create_video_clip(self, chunks, start_offset, stop_offset):
-        playlist_duration = stop_offset - start_offset
-        playlist_offset = 0
-        playlist_streams = []
-        playlist_tags = []
-
-        for chunk in chunks:
-            chunk_url = chunk["url"]
-            chunk_length = chunk["length"]
-            chunk_start = playlist_offset
-            chunk_stop = chunk_start + chunk_length
-            chunk_stream = HTTPStream(self.session, chunk_url)
-
-            if chunk_start <= start_offset <= chunk_stop:
-                try:
-                    headers = extract_flv_header_tags(chunk_stream)
-                except IOError as err:
-                    raise StreamError("Error while parsing FLV: {0}", err)
-
-                if not headers.metadata:
-                    raise StreamError("Missing metadata tag in the first chunk")
-
-                metadata = headers.metadata.data.value
-                keyframes = metadata.get("keyframes")
-
-                if not keyframes:
-                    if chunk["upkeep"] == "fail":
-                        raise StreamError("Unable to seek into muted chunk, try another timestamp")
-                    else:
-                        raise StreamError("Missing keyframes info in the first chunk")
-
-                keyframe_offset = None
-                keyframe_offsets = keyframes.get("filepositions")
-                keyframe_times = [playlist_offset + t for t in keyframes.get("times")]
-                for time, offset in zip(keyframe_times, keyframe_offsets):
-                    if time > start_offset:
-                        break
-
-                    keyframe_offset = offset
-
-                if keyframe_offset is None:
-                    raise StreamError("Unable to find a keyframe to seek to "
-                                      "in the first chunk")
-
-                chunk_headers = dict(Range="bytes={0}-".format(int(keyframe_offset)))
-                chunk_stream = HTTPStream(self.session, chunk_url,
-                                          headers=chunk_headers)
-                playlist_streams.append(chunk_stream)
-                for tag in headers:
-                    playlist_tags.append(tag)
-            elif start_offset <= chunk_start < stop_offset:
-                playlist_streams.append(chunk_stream)
-
-            playlist_offset += chunk_length
-
-        return FLVPlaylist(self.session, playlist_streams,
-                           tags=playlist_tags, duration=playlist_duration)
-
-    def _get_video_streams(self):
-        self.logger.debug("Getting video steams for {0} (type={1})".format(self.video_id, self.video_type))
-        self._authenticate()
-
-        if self.video_type == "b":
-            self.video_type = "a"
-
+        sig, token = data
         try:
-            videos = self.api.videos(self.video_type + self.video_id,
-                                     schema=_video_schema)
-        except PluginError as err:
-            if "HTTP/1.1 0 ERROR" in str(err):
-                raise NoStreamsError(self.url)
-            else:
-                raise
+            restricted_bitrates = self.api.parse_token(token)
+        except PluginError:
+            restricted_bitrates = []
 
-        # Parse the "t" query parameter on broadcasts and adjust
-        # start offset if needed.
-        time_offset = self.params.get("t")
-        if time_offset:
-            try:
-                time_offset = hours_minutes_seconds(time_offset)
-            except ValueError:
-                time_offset = 0
+        return sig, token, restricted_bitrates
 
-            videos["start_offset"] += time_offset
+    def _get_hls_streams_live(self):
+        # only get the token once the channel has been resolved
+        log.debug(f"Getting live HLS streams for {self.channel}")
+        self.session.http.headers.update({
+            "referer": "https://player.twitch.tv",
+            "origin": "https://player.twitch.tv",
+        })
+        sig, token, restricted_bitrates = self._access_token(True, self.channel)
+        url = self.usher.channel(self.channel, sig=sig, token=token, fast_bread=True)
 
-        return self._create_playlist_streams(videos)
+        return self._get_hls_streams(url, restricted_bitrates)
 
-    def _access_token(self, type="live"):
+    def _get_hls_streams_video(self):
+        log.debug(f"Getting HLS streams for video ID {self.video_id}")
+        sig, token, restricted_bitrates = self._access_token(False, self.video_id)
+        url = self.usher.video(self.video_id, nauthsig=sig, nauth=token)
+
+        # If the stream is a VOD that is still being recorded, the stream should start at the beginning of the recording
+        return self._get_hls_streams(url, restricted_bitrates, force_restart=True)
+
+    def _get_hls_streams(self, url, restricted_bitrates, **extra_params):
         try:
-            if type == "live":
-                endpoint = "channels"
-                value = self.channel
-            elif type == "video":
-                endpoint = "vods"
-                value = self.video_id
-
-            sig, token = self.api.access_token(endpoint, value,
-                                               schema=_access_token_schema)
-        except PluginError as err:
-            if "404 Client Error" in str(err):
-                raise NoStreamsError(self.url)
-            else:
-                raise
-
-        return sig, token
-
-    def _check_for_host(self):
-        host_info = self.api.hosted_channel(include_logins=1, host=self.channel_id).json()["hosts"][0]
-        if "target_login" in host_info and host_info["target_login"].lower() != self.channel.lower():
-            self.logger.info("{0} is hosting {1}".format(self.channel, host_info["target_login"]))
-            return host_info["target_login"]
-
-    def _get_hls_streams(self, stream_type="live"):
-        self.logger.debug("Getting {0} HLS streams for {1}".format(stream_type, self.channel))
-        self._authenticate()
-        self._hosted_chain.append(self.channel)
-
-        if stream_type == "live":
-            hosted_channel = self._check_for_host()
-            if hosted_channel and self.options.get("disable_hosting"):
-                self.logger.info("hosting was disabled by command line option")
-            elif hosted_channel:
-                self.logger.info("switching to {0}", hosted_channel)
-                if hosted_channel in self._hosted_chain:
-                    self.logger.error(
-                        u"A loop of hosted channels has been detected, "
-                        "cannot find a playable stream. ({0})".format(
-                            u" -> ".join(self._hosted_chain + [hosted_channel])))
-                    return {}
-                self.channel = hosted_channel
-                return self._get_hls_streams(stream_type)
-
-            # only get the token once the channel has been resolved
-            sig, token = self._access_token(stream_type)
-            url = self.usher.channel(self.channel, sig=sig, token=token, fast_bread=True)
-        elif stream_type == "video":
-            sig, token = self._access_token(stream_type)
-            url = self.usher.video(self.video_id, nauthsig=sig, nauth=token)
-        else:
-            self.logger.debug("Unknown HLS stream type: {0}".format(stream_type))
-            return {}
-
-        time_offset = self.params.get("t", 0)
-        if time_offset:
-            try:
-                time_offset = hours_minutes_seconds(time_offset)
-            except ValueError:
-                time_offset = 0
-
-        try:
-            # If the stream is a VOD that is still being recorded the stream should start at the
-            # beginning of the recording
             streams = TwitchHLSStream.parse_variant_playlist(
                 self.session,
                 url,
-                start_offset=time_offset,
-                force_restart=not stream_type == "live"
+                start_offset=self.time_offset,
+                # Check if the media playlists are accessible:
+                # This is a workaround for checking the GQL API for the channel's live status,
+                # which can be delayed by up to a minute.
+                check_streams=True,
+                disable_ads=self.get_option("disable-ads"),
+                low_latency=self.get_option("low-latency"),
+                **extra_params,
             )
-        except IOError as err:
-            err = str(err)
-            if "404 Client Error" in err or "Failed to parse playlist" in err:
+        except OSError as err:
+            # TODO: fix the "err" attribute set by HTTPSession.request()
+            orig = getattr(err, "err", None)
+            if isinstance(orig, HTTPError) and orig.response.status_code >= 400:
+                # The playlist's error response may include JSON data with an error message
+                with suppress(PluginError):
+                    error = validate.Schema(
+                        validate.parse_json(),
+                        [
+                            {
+                                "type": "error",
+                                "error": str,
+                            },
+                        ],
+                        validate.get((0, "error")),
+                    ).validate(orig.response.text)
+                    # Only log error messages if the channel is actually live
+                    if self.get_id():
+                        log.error(error or "Could not access HLS playlist")
+                # Don't raise and simply return no streams on 4xx/5xx playlist responses
                 return
-            else:
-                raise PluginError(err)
+            raise PluginError(err) from err
 
-        try:
-            token = parse_json(token, schema=_token_schema)
-            for name in token["restricted_bitrates"]:
-                if name not in streams:
-                    self.logger.warning("The quality '{0}' is not available "
-                                        "since it requires a subscription.",
-                                        name)
-        except PluginError:
-            pass
+        for name in restricted_bitrates:
+            if name not in streams:
+                log.warning(f"The quality '{name}' is not available since it requires a subscription.")
 
         return streams
 
     def _get_clips(self):
-        quality_options = self.api.clip_status(self.channel, self.clip_name, schema=_quality_options_schema)
-        streams = {}
-        for quality_option in quality_options:
-            streams[quality_option["quality"]] = HTTPStream(self.session, quality_option["source"])
-        return streams
+        try:
+            sig, token, streams = self.api.clips(self.clip_id)
+        except (PluginError, TypeError):
+            return
+
+        for quality, stream in streams:
+            yield quality, HTTPStream(self.session, update_qsd(stream, {"sig": sig, "token": token}))
 
     def _get_streams(self):
         if self.video_id:
-            if self.video_type == "v":
-                return self._get_hls_streams("video")
-            else:
-                return self._get_video_streams()
-        elif self.clip_name:
+            return self._get_hls_streams_video()
+        elif self.clip_id:
             return self._get_clips()
-        elif self._channel:
-            return self._get_hls_streams("live")
+        elif self.channel:
+            return self._get_hls_streams_live()
 
 
 __plugin__ = Twitch

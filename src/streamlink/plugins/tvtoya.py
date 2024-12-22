@@ -1,35 +1,48 @@
-import logging
+"""
+$description Polish live TV channel owned by Toya.
+$url tvtoya.pl
+$type live
+"""
+
 import re
 
-from streamlink.plugin import Plugin
-from streamlink.plugin.api import useragents
-from streamlink.stream import HLSStream
-from streamlink.utils import update_scheme
-
-log = logging.getLogger(__name__)
+from streamlink.plugin import Plugin, PluginError, pluginmatcher
+from streamlink.plugin.api import validate
+from streamlink.stream.hls import HLSStream
 
 
+@pluginmatcher(
+    re.compile(r"https?://(?:www\.)?tvtoya\.pl/player/live"),
+)
 class TVToya(Plugin):
-    _url_re = re.compile(r"https?://tvtoya.pl/live")
-    _playlist_re = re.compile(r'data-stream="([^"]+)"')
-
-    @classmethod
-    def can_handle_url(cls, url):
-        return cls._url_re.match(url) is not None
-
     def _get_streams(self):
-        self.session.set_option('hls-live-edge', 10)
-        res = self.session.http.get(self.url)
-        playlist_m = self._playlist_re.search(res.text)
-
-        if playlist_m:
-            return HLSStream.parse_variant_playlist(
-                self.session,
-                update_scheme(self.url, playlist_m.group(1)),
-                headers={'Referer': self.url, 'User-Agent': useragents.ANDROID}
+        try:
+            hls = self.session.http.get(
+                self.url,
+                schema=validate.Schema(
+                    validate.parse_html(),
+                    validate.xml_xpath_string(".//script[@type='application/json'][@id='__NEXT_DATA__']/text()"),
+                    str,
+                    validate.parse_json(),
+                    {
+                        "props": {
+                            "pageProps": {
+                                "type": "live",
+                                "url": validate.all(
+                                    str,
+                                    validate.transform(lambda url: url.replace("https:////", "https://")),
+                                    validate.url(path=validate.endswith(".m3u8")),
+                                ),
+                            },
+                        },
+                    },
+                    validate.get(("props", "pageProps", "url")),
+                ),
             )
-        else:
-            log.debug("Could not find stream data")
+        except PluginError:
+            return
+
+        return HLSStream.parse_variant_playlist(self.session, hls)
 
 
 __plugin__ = TVToya

@@ -1,28 +1,16 @@
-import unittest
-
 from streamlink.plugins.ruv import Ruv
+from tests.plugins import PluginCanHandleUrl
 
 
-class TestPluginRuv(unittest.TestCase):
-    def test_can_handle_url(self):
-        # should match
-        self.assertTrue(Ruv.can_handle_url("ruv.is/ruv"))
-        self.assertTrue(Ruv.can_handle_url("http://ruv.is/ruv"))
-        self.assertTrue(Ruv.can_handle_url("http://ruv.is/ruv/"))
-        self.assertTrue(Ruv.can_handle_url("https://ruv.is/ruv/"))
-        self.assertTrue(Ruv.can_handle_url("http://www.ruv.is/ruv"))
-        self.assertTrue(Ruv.can_handle_url("http://www.ruv.is/ruv/"))
-        self.assertTrue(Ruv.can_handle_url("ruv.is/ruv2"))
-        self.assertTrue(Ruv.can_handle_url("ruv.is/ras1"))
-        self.assertTrue(Ruv.can_handle_url("ruv.is/ras2"))
-        self.assertTrue(Ruv.can_handle_url("ruv.is/rondo"))
-        self.assertTrue(Ruv.can_handle_url("http://www.ruv.is/spila/ruv/ol-2018-ishokki-karla/20180217"))
-        self.assertTrue(Ruv.can_handle_url("http://www.ruv.is/spila/ruv/frettir/20180217"))
+class TestPluginCanHandleUrlRuv(PluginCanHandleUrl):
+    __plugin__ = Ruv
 
-        # shouldn't match
-        self.assertFalse(Ruv.can_handle_url("rruv.is/ruv"))
-        self.assertFalse(Ruv.can_handle_url("ruv.is/ruvnew"))
-        self.assertFalse(Ruv.can_handle_url("https://www.bloomberg.com/live/"))
-        self.assertFalse(Ruv.can_handle_url("https://www.bloomberg.com/politics/articles/2017-04-17/french-race-up-for-grabs-days-before-voters-cast-first-ballots"))
-        self.assertFalse(Ruv.can_handle_url("http://www.tvcatchup.com/"))
-        self.assertFalse(Ruv.can_handle_url("http://www.youtube.com/"))
+    should_match_groups = [
+        (("live", "https://www.ruv.is/sjonvarp/beint/ruv"), {"channel": "ruv"}),
+        (("live", "https://www.ruv.is/sjonvarp/beint/ruv2"), {"channel": "ruv2"}),
+        (("live", "https://www.ruv.is/utvarp/beint/ras1"), {"channel": "ras1"}),
+        (("live", "https://www.ruv.is/utvarp/beint/ras2"), {"channel": "ras2"}),
+        (("vod", "https://www.ruv.is/sjonvarp/spila/vedur/30766/agcf5m"), {"id": "30766", "episode": "agcf5m"}),
+        (("vod", "https://www.ruv.is/sjonvarp/spila/kastljos/35422/ahpu2g"), {"id": "35422", "episode": "ahpu2g"}),
+        (("vod", "https://www.ruv.is/utvarp/spila/laesi/37102/b1qk71"), {"id": "37102", "episode": "b1qk71"}),
+    ]

@@ -1,42 +1,77 @@
-import re
-import logging
+"""
+$description Sporting live stream and video content, owned by Silver Chalice and Sinclair Broadcast Group.
+$url watchstadium.com
+$type live, vod
+"""
 
-from streamlink.plugin import Plugin
-from streamlink.stream import HLSStream
-from streamlink.utils import parse_json
+import logging
+import re
+
+from streamlink.plugin import Plugin, PluginError, pluginmatcher
+from streamlink.plugin.api import validate
+from streamlink.stream.hls import HLSStream
+from streamlink.utils.url import update_qsd
+
 
 log = logging.getLogger(__name__)
 
 
+@pluginmatcher(
+    re.compile(r"https?://(?:www\.)?watchstadium\.com/"),
+)
 class Stadium(Plugin):
-    url_re = re.compile(r"""https?://(?:www\.)?watchstadium\.com/live""")
-    API_URL = "https://player-api.new.livestream.com/accounts/{account_id}/events/{event_id}/stream_info"
-    _stream_data_re = re.compile(r"var StadiumSiteData = (\{.*?});", re.M | re.DOTALL)
-
-    @classmethod
-    def can_handle_url(cls, url):
-        return cls.url_re.match(url) is not None
+    _API_URL = "https://edge.api.brightcove.com/playback/v1/accounts/{data_account}/videos/{data_video_id}"
+    _PLAYER_URL = "https://players.brightcove.net/{data_account}/{data_player}_default/index.min.js"
 
     def _get_streams(self):
-        res = self.session.http.get(self.url)
-        m = self._stream_data_re.search(res.text)
-        if m:
-            data = parse_json(m.group(1))
-            if data['LivestreamEnabled'] == '1':
-                account_id = data['LivestreamArgs']['account_id']
-                event_id = data['LivestreamArgs']['event_id']
-                log.debug("Found account_id={account_id} and event_id={event_id}".format(account_id=account_id, event_id=event_id))
+        try:
+            data = self.session.http.get(
+                self.url,
+                schema=validate.Schema(
+                    validate.parse_html(),
+                    validate.xml_find(".//video[@id='brightcove_video_player']"),
+                    validate.union_get("data-video-id", "data-account", "data-ad-config-id", "data-player"),
+                ),
+            )
+        except PluginError:
+            return
+        data_video_id, data_account, data_ad_config_id, data_player = data
 
-                url = self.API_URL.format(account_id=account_id, event_id=event_id)
-                api_res = self.session.http.get(url)
-                api_data = self.session.http.json(api_res)
-                stream_url = api_data.get('secure_m3u8_url') or api_data.get('m3u8_url')
-                if stream_url:
-                    return HLSStream.parse_variant_playlist(self.session, stream_url)
-                else:
-                    log.error("Could not find m3u8_url")
-            else:
-                log.error("Stream is offline")
+        url = self._PLAYER_URL.format(data_account=data_account, data_player=data_player)
+        policy_key = self.session.http.get(
+            url,
+            schema=validate.Schema(
+                re.compile(r"""options:\s*{.+policyKey:\s*"([^"]+)""", re.DOTALL),
+                validate.any(None, validate.get(1)),
+            ),
+        )
+        if not policy_key:
+            return
+
+        url = self._API_URL.format(data_account=data_account, data_video_id=data_video_id)
+        if data_ad_config_id is not None:
+            url = update_qsd(url, dict(ad_config_id=data_ad_config_id))
+
+        streams = self.session.http.get(
+            url,
+            headers={"Accept": f"application/json;pk={policy_key}"},
+            schema=validate.Schema(
+                validate.parse_json(),
+                {
+                    "sources": [
+                        {
+                            validate.optional("type"): str,
+                            "src": validate.url(),
+                        },
+                    ],
+                },
+                validate.get("sources"),
+                validate.filter(lambda source: source.get("type") == "application/x-mpegURL"),
+            ),
+        )
+
+        for stream in streams:
+            return HLSStream.parse_variant_playlist(self.session, stream["src"])
 
 
 __plugin__ = Stadium

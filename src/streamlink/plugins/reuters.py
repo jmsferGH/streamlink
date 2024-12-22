@@ -1,92 +1,96 @@
+"""
+$description Global business, financial, national and international news.
+$url reuters.com
+$url reuters.tv
+$type live, vod
+"""
+
 import logging
 import re
 
-from streamlink.plugin import Plugin
-from streamlink.plugin.api import useragents, validate
-from streamlink.plugin.api.utils import itertags
-from streamlink.stream import HLSStream
-from streamlink.utils import parse_json
+from streamlink.plugin import Plugin, PluginError, pluginmatcher
+from streamlink.plugin.api import validate
+from streamlink.stream.hls import HLSStream
+
 
 log = logging.getLogger(__name__)
 
 
+@pluginmatcher(
+    re.compile(r"https?://([\w-]+\.)*reuters\.(com|tv)"),
+)
 class Reuters(Plugin):
-    _url_re = re.compile(r'https?://(?:www\.)?reuters\.tv')
-    _hls_re = re.compile(r'''(?<!')https://[^"';!<>]+\.m3u8''')
-    _json_re = re.compile(r'''(?P<data>{.*});''')
-    _data_schema = validate.Schema(
-        validate.transform(_json_re.search),
-        validate.any(
-            None,
-            validate.all(
-                validate.get('data'),
-                validate.transform(parse_json),
-                {
-                    'title': validate.text,
-                    'items': [
-                        {
-                            'title': validate.text,
-                            'type': validate.text,
-                            'resources': [
-                                {
-                                    'mimeType': validate.text,
-                                    'uri': validate.url(),
-                                    validate.optional('protocol'): validate.text,
-                                    validate.optional('entityType'): validate.text,
-                                }
-                            ]
-                        }
-                    ],
-                }
-            )
-        )
-    )
-
-    def __init__(self, url):
-        super(Reuters, self).__init__(url)
-        self.session.http.headers.update({'User-Agent': useragents.FIREFOX})
-        self.title = None
-
-    @classmethod
-    def can_handle_url(cls, url):
-        return cls._url_re.match(url) is not None
-
-    def get_title(self):
-        if not self.title:
-            self._get_data()
-        return self.title
-
     def _get_data(self):
-        res = self.session.http.get(self.url)
-        for script in itertags(res.text, 'script'):
-            if script.attributes.get('type') == 'text/javascript' and 'RTVJson' in script.text:
-                data = self._data_schema.validate(script.text)
-                if not data:
-                    continue
-                self.title = data['title']
-                for item in data['items']:
-                    if data['title'] == item['title']:
-                        log.trace('{0!r}'.format(item))
-                        log.debug('Type: {0}'.format(item['type']))
-                        for res in item['resources']:
-                            if res['mimeType'] == 'application/x-mpegURL':
-                                return res['uri']
+        root = self.session.http.get(
+            self.url,
+            schema=validate.Schema(
+                validate.parse_html(),
+            ),
+        )
 
-        # fallback
-        for title in itertags(res.text, 'title'):
-            self.title = title.text
-        m = self._hls_re.search(res.text)
-        if not m:
-            log.error('Unsupported PageType.')
-            return
-        return m.group(0)
+        try:
+            log.debug("Trying to find source via meta tag")
+            schema = validate.Schema(
+                validate.xml_xpath_string(".//meta[@property='og:video'][1]/@content"),
+                validate.url(),
+            )
+            return schema.validate(root)
+        except PluginError:
+            pass
+
+        try:
+            log.debug("Trying to find source via next-head")
+            schema = validate.Schema(
+                validate.xml_findtext(".//script[@type='application/ld+json'][@class='next-head']"),
+                validate.parse_json(),
+                {"contentUrl": validate.url()},
+                validate.get("contentUrl"),
+            )
+            return schema.validate(root)
+        except PluginError:
+            pass
+
+        schema_fusion = validate.xml_findtext(".//script[@type='application/javascript'][@id='fusion-metadata']")
+        schema_video = validate.all(
+            {"source": {"hls": validate.url()}},
+            validate.get(("source", "hls")),
+        )
+        try:
+            log.debug("Trying to find source via fusion-metadata globalContent")
+            schema = validate.Schema(
+                schema_fusion,
+                validate.regex(re.compile(r"Fusion\s*\.\s*globalContent\s*=\s*(?P<json>{.+?})\s*;\s*Fusion\s*\.", re.DOTALL)),
+                validate.get("json"),
+                validate.parse_json(),
+                {"result": {"related_content": {"videos": list}}},
+                validate.get(("result", "related_content", "videos", 0)),
+                schema_video,
+            )
+            return schema.validate(root)
+        except PluginError:
+            pass
+
+        try:
+            log.debug("Trying to find source via fusion-metadata contentCache")
+            schema = validate.Schema(
+                schema_fusion,
+                validate.regex(re.compile(r"Fusion\s*\.\s*contentCache\s*=\s*(?P<json>{.+?})\s*;\s*Fusion\s*\.", re.DOTALL)),
+                validate.get("json"),
+                validate.parse_json(),
+                {"videohub-by-guid-v1": {str: {"data": {"result": {"videos": list}}}}},
+                validate.get("videohub-by-guid-v1"),
+                validate.transform(lambda obj: obj[next(iter((obj.keys())))]),
+                validate.get(("data", "result", "videos", 0)),
+                schema_video,
+            )
+            return schema.validate(root)
+        except PluginError:
+            pass
 
     def _get_streams(self):
         hls_url = self._get_data()
-        if not hls_url:
-            return
-        log.debug('URL={0}'.format(hls_url))
-        return HLSStream.parse_variant_playlist(self.session, hls_url)
+        if hls_url:
+            return HLSStream.parse_variant_playlist(self.session, hls_url)
 
 
 __plugin__ = Reuters

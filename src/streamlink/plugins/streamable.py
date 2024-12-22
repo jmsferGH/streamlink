@@ -1,41 +1,48 @@
+"""
+$description Global video hosting platform.
+$url streamable.com
+$type vod
+"""
+
 import re
 
-from streamlink.plugin import Plugin
+from streamlink.plugin import Plugin, pluginmatcher
 from streamlink.plugin.api import validate
-from streamlink.stream import HTTPStream
-from streamlink.utils import parse_json, update_scheme
+from streamlink.stream.http import HTTPStream
+from streamlink.utils.url import update_scheme
 
 
+@pluginmatcher(
+    re.compile(r"https?://(?:www\.)?streamable\.com/(.+)"),
+)
 class Streamable(Plugin):
-    url_re = re.compile(r"https?://(?:www\.)?streamable\.com/(.+)")
-    meta_re = re.compile(r'''var\s*videoObject\s*=\s*({.*});''')
-    config_schema = validate.Schema(
-        validate.transform(meta_re.search),
-        validate.any(None,
-                     validate.all(
-                         validate.get(1),
-                         validate.transform(parse_json),
-                         {
-                             "files": {validate.text: {"url": validate.url(),
-                                                       "width": int,
-                                                       "height": int,
-                                                       "bitrate": int}}
-                         })
-                     )
-    )
-
-    @classmethod
-    def can_handle_url(cls, url):
-        return cls.url_re.match(url) is not None
-
     def _get_streams(self):
-        data = self.session.http.get(self.url, schema=self.config_schema)
+        data = self.session.http.get(
+            self.url,
+            schema=validate.Schema(
+                re.compile(r"var\s*videoObject\s*=\s*({.*?});"),
+                validate.none_or_all(
+                    validate.get(1),
+                    validate.parse_json(),
+                    {
+                        "files": {
+                            str: {
+                                "url": validate.url(),
+                                "width": int,
+                                "height": int,
+                                "bitrate": int,
+                            },
+                        },
+                    },
+                ),
+            ),
+        )
 
         for info in data["files"].values():
-            stream_url = update_scheme(self.url, info["url"])
+            stream_url = update_scheme("https://", info["url"])
             # pick the smaller of the two dimensions, for landscape v. portrait videos
             res = min(info["width"], info["height"])
-            yield "{0}p".format(res), HTTPStream(self.session, stream_url)
+            yield f"{res}p", HTTPStream(self.session, stream_url)
 
 
 __plugin__ = Streamable
